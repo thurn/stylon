@@ -144,6 +144,57 @@ fn fix_renames_integration_tests_without_changing_target_name() {
 }
 
 #[test]
+fn fix_carries_child_module_edits_through_an_integration_test_move() {
+    let directory = tempdir().expect("temporary directory");
+    fs::create_dir_all(directory.path().join("src")).expect("source directory");
+    fs::create_dir_all(directory.path().join("tests/coverage")).expect("tests directory");
+    fs::write(
+        directory.path().join("Cargo.toml"),
+        "[package]\nname='nested_test_fixture'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .expect("manifest");
+    fs::write(
+        directory.path().join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"nested_test_fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("lockfile");
+    fs::write(directory.path().join("src/lib.rs"), "pub fn library() {}\n").expect("library");
+    fs::write(
+        directory.path().join("tests/contract.rs"),
+        "mod coverage;\n\nfn helper() {}\n\n#[test]\nfn contract() { helper(); }\n",
+    )
+    .expect("integration root");
+    fs::write(
+        directory.path().join("tests/coverage/mod.rs"),
+        "use super::helper;\n\n#[test]\nfn covered() { helper(); }\n",
+    )
+    .expect("child module");
+    let arguments = [
+        OsString::from("stylon"),
+        OsString::from("--fix"),
+        directory.path().as_os_str().to_owned(),
+    ];
+
+    assert_eq!(
+        super::super::run(arguments.clone()),
+        std::process::ExitCode::SUCCESS
+    );
+    let root =
+        fs::read_to_string(directory.path().join("tests/contract_tests.rs")).expect("moved root");
+    assert!(
+        root.contains("#[path = \"coverage/mod_tests.rs\"]"),
+        "{root}"
+    );
+    let child = fs::read_to_string(directory.path().join("tests/coverage/mod_tests.rs"))
+        .expect("moved child");
+    assert!(child.contains("use super::helper;"));
+    assert_eq!(
+        super::super::run(arguments),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
 fn fix_extracts_tests_from_a_cargo_entry_file() {
     let directory = tempdir().expect("temporary directory");
     fs::create_dir(directory.path().join("src")).expect("source directory");
@@ -213,6 +264,7 @@ fn baseline_validation_failure_writes_no_source_changes() {
     );
     assert_eq!(fs::read(source_path).expect("unchanged source"), original);
     assert!(!directory.path().join(".stylon-transaction").exists());
+    assert!(!directory.path().join(".stylon.lock").exists());
 }
 
 #[test]
@@ -244,4 +296,5 @@ fn post_fix_validation_failure_restores_source_changes() {
     );
     assert_eq!(fs::read(source_path).expect("restored source"), original);
     assert!(!directory.path().join(".stylon-transaction").exists());
+    assert!(!directory.path().join(".stylon.lock").exists());
 }

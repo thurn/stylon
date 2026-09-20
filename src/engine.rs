@@ -155,8 +155,15 @@ pub(crate) fn run(cli: &Cli) -> ExitCode {
         .map(|input| (input.path.to_path_buf(), input.source.to_owned()))
         .collect();
     virtual_manifests.extend(workspace.replacements.clone());
-    let file_suffix =
+    let mut file_suffix =
         crate::tests_layout::analyze_file_suffix(&config, &inline_inputs, &virtual_manifests);
+    for (source, destination) in &file_suffix.moves {
+        if let Some(replacement) = file_suffix.replacements.remove(source)
+            && let Some(created) = file_suffix.creations.get_mut(destination)
+        {
+            *created = replacement;
+        }
+    }
     diagnostics.extend(file_suffix.diagnostics.clone());
     errors.extend(file_suffix.errors.clone());
 
@@ -202,6 +209,7 @@ pub(crate) fn run(cli: &Cli) -> ExitCode {
             &project_replacements,
             &creations,
             &file_suffix.deletions,
+            &file_suffix.moves,
         ) {
             Ok(changes) => match verify_plan(&config, &parsed, &changes) {
                 Ok(()) => {
@@ -335,6 +343,7 @@ fn plan_changes(
     workspace_replacements: &std::collections::BTreeMap<PathBuf, String>,
     creations: &std::collections::BTreeMap<PathBuf, String>,
     deletions: &std::collections::BTreeSet<PathBuf>,
+    moves: &std::collections::BTreeMap<PathBuf, PathBuf>,
 ) -> Result<Vec<Change>, OperationalError> {
     let mut changes: Vec<_> = parsed
         .iter()
@@ -395,7 +404,13 @@ fn plan_changes(
     }
     for (path, source) in creations {
         let relative = config.relative(path);
-        let replacement = fixed_source(config, &relative, source)?;
+        let module_relative = moves
+            .iter()
+            .find_map(|(source, destination)| {
+                (destination == path).then(|| config.relative(source))
+            })
+            .unwrap_or_else(|| relative.clone());
+        let replacement = fixed_source_with_module(config, &relative, &module_relative, source)?;
         changes.push(Change {
             path: path.clone(),
             original: None,
@@ -437,6 +452,15 @@ fn fixed_source(
     relative: &std::path::Path,
     original: &str,
 ) -> Result<String, OperationalError> {
+    fixed_source_with_module(config, relative, relative, original)
+}
+
+fn fixed_source_with_module(
+    config: &Config,
+    relative: &std::path::Path,
+    module_relative: &std::path::Path,
+    original: &str,
+) -> Result<String, OperationalError> {
     let mut source = original.to_owned();
     let mut seen = std::collections::HashSet::new();
     for _ in 0..8 {
@@ -448,7 +472,7 @@ fn fixed_source(
             });
         }
         let before = source.clone();
-        source = apply_qualification_edits(config, relative, source)?;
+        source = apply_qualification_edits(config, relative, module_relative, source)?;
         ensure_parseable(relative, &source)?;
         source = apply_rule_edits(config, relative, source, "imports.top-level")?;
         ensure_parseable(relative, &source)?;
@@ -479,21 +503,14 @@ fn fixed_source(
 fn apply_qualification_edits(
     config: &Config,
     relative: &std::path::Path,
+    module_relative: &std::path::Path,
     mut source: String,
 ) -> Result<String, OperationalError> {
-    let mut edits: Vec<_> = rules::check(config, relative, &source)
-        .into_iter()
-        .filter(|finding| {
-            matches!(
-                finding.diagnostic.rule_id,
-                "imports.absolute-crate-path"
-                    | "path.enum-variant-qualification"
-                    | "path.function-qualification"
-                    | "path.type-qualification"
-            )
-        })
-        .flat_map(|finding| finding.edits)
-        .collect();
+    let mut edits: Vec<_> =
+        crate::qualification::check_with_module(config, relative, module_relative, &source)
+            .into_iter()
+            .flat_map(|finding| finding.edits)
+            .collect();
     edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
     ensure_non_overlapping(relative, &edits)?;
     for edit in edits.into_iter().rev() {

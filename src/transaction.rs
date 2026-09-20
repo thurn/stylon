@@ -527,24 +527,42 @@ fn permissions_from_mode(_mode: u32) -> Option<Permissions> {
 
 struct ProjectLock {
     file: File,
+    path: PathBuf,
+    created: bool,
 }
 
 impl ProjectLock {
     fn acquire(root: &Path) -> Result<Self, OperationalError> {
         let path = root.join(LOCK_FILE);
-        let file = OpenOptions::new()
+        let created_file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| {
-                error(
+            .create_new(true)
+            .open(&path);
+        let (file, created) = match created_file {
+            Ok(file) => (file, true),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .map_err(|source| {
+                        error(
+                            "filesystem",
+                            format!("cannot open project lock: {source}"),
+                            vec![PathBuf::from(LOCK_FILE)],
+                        )
+                    })?;
+                (file, false)
+            }
+            Err(source) => {
+                return Err(error(
                     "filesystem",
-                    format!("cannot open project lock: {source}"),
+                    format!("cannot create project lock: {source}"),
                     vec![PathBuf::from(LOCK_FILE)],
-                )
-            })?;
+                ));
+            }
+        };
         file.try_lock_exclusive().map_err(|source| {
             error(
                 "lock",
@@ -552,13 +570,20 @@ impl ProjectLock {
                 vec![PathBuf::from(LOCK_FILE)],
             )
         })?;
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            path,
+            created,
+        })
     }
 }
 
 impl Drop for ProjectLock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
+        if self.created {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 

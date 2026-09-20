@@ -47,3 +47,34 @@ fn rewrites_relative_imports_from_the_file_module() {
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].edits[0].replacement, "crate::game::card::Card;");
 }
+
+#[test]
+fn exempts_self_associated_types_and_standard_module_aliases() {
+    let (_directory, config) = config();
+    let source = "use std::{fmt, io};\n\nfn result() -> fmt::Result { todo!() }\nfn associated() -> Self::Output { todo!() }\nfn generic<S>() -> Result<S::Ok, S::Error> { todo!() }\nfn error() -> io::Error { todo!() }\n";
+
+    let findings = check(&config, Path::new("src/lib.rs"), source);
+
+    assert!(findings.is_empty());
+}
+
+#[test]
+fn resolves_super_from_an_extracted_test_module() {
+    let (_directory, config) = config();
+    let source = "use super::helper;\n";
+
+    let findings = check(&config, Path::new("src/parser_tests.rs"), source);
+
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].edits[0].replacement, "crate::parser::helper;");
+}
+
+#[test]
+fn keeps_a_type_qualified_when_its_leaf_is_already_used() {
+    let (_directory, config) = config();
+    let source = "fn example(value: Box<u8>) { external::host::Box::new(); drop(value); }\n";
+
+    let findings = check(&config, Path::new("src/lib.rs"), source);
+
+    assert!(findings.is_empty());
+}

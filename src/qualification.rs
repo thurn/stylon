@@ -1,15 +1,31 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path};
 
-use ra_ap_syntax::ast::{self, AstNode, HasModuleItem, HasName};
+use ra_ap_syntax::ast::{self, AstNode, HasGenericParams, HasModuleItem, HasName};
 use ra_ap_syntax::{Edition, SourceFile};
 
 use crate::config::Config;
 use crate::diagnostic::Diagnostic;
 use crate::rules::{Edit, Finding};
 use ra_ap_syntax::SyntaxNode;
+use ra_ap_syntax::ast::Enum;
+use ra_ap_syntax::ast::Fn;
+use ra_ap_syntax::ast::Impl;
+use ra_ap_syntax::ast::Struct;
+use ra_ap_syntax::ast::Trait;
+use ra_ap_syntax::ast::TypeAlias;
+use ra_ap_syntax::ast::Union;
 
 pub(crate) fn check(config: &Config, relative: &Path, source: &str) -> Vec<Finding> {
+    check_with_module(config, relative, relative, source)
+}
+
+pub(crate) fn check_with_module(
+    config: &Config,
+    relative: &Path,
+    module_relative: &Path,
+    source: &str,
+) -> Vec<Finding> {
     let parsed = SourceFile::parse(source, Edition::Edition2024);
     let file = parsed.tree();
     let bindings = imported_type_names(&file);
@@ -28,7 +44,7 @@ pub(crate) fn check(config: &Config, relative: &Path, source: &str) -> Vec<Findi
         &mut candidates,
     );
     if config.rule_enabled("imports.absolute-crate-path", relative) {
-        collect_relative_imports(relative, &file, &mut candidates);
+        collect_relative_imports(module_relative, &file, &mut candidates);
     }
     remove_type_collisions(&mut candidates);
     candidates.sort_by_key(|candidate| candidate.range.start);
@@ -124,7 +140,10 @@ fn collect_type_paths(
         let Some(segments) = simple_segments(&path) else {
             continue;
         };
-        if segments.len() < 2 || exempt_root(&segments[0]) {
+        if segments.len() < 2
+            || exempt_path_root(&segments[0], aliases)
+            || generic_type_parameter(path.syntax(), &segments[0])
+        {
             continue;
         }
         let leaf = segments.last().expect("path has a leaf").clone();
@@ -162,7 +181,10 @@ fn collect_expression_paths(
         let Some(segments) = simple_segments(&path) else {
             continue;
         };
-        if segments.len() < 3 || exempt_root(&segments[0]) {
+        if segments.len() < 3
+            || exempt_path_root(&segments[0], aliases)
+            || generic_type_parameter(path.syntax(), &segments[0])
+        {
             continue;
         }
         let terminal = segments.last().expect("path has a terminal");
@@ -332,18 +354,43 @@ fn remove_type_collisions(candidates: &mut Vec<Candidate>) {
 }
 
 fn imported_type_names(file: &ast::SourceFile) -> HashSet<String> {
-    file.items()
-        .filter_map(|item| match item {
-            ast::Item::Use(import) => Some(import.syntax().text().to_string()),
-            _ => None,
-        })
-        .flat_map(|text| {
-            text.split(|character: char| !character.is_alphanumeric() && character != '_')
-                .filter(|word| word.chars().next().is_some_and(char::is_uppercase))
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .collect()
+    let mut names: HashSet<_> = ["Box", "Option", "Result", "String", "Vec"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    names.extend(file.items().filter_map(|item| match item {
+        ast::Item::Enum(item) => item.name().map(|name| name.text().to_string()),
+        ast::Item::Struct(item) => item.name().map(|name| name.text().to_string()),
+        ast::Item::Trait(item) => item.name().map(|name| name.text().to_string()),
+        ast::Item::TypeAlias(item) => item.name().map(|name| name.text().to_string()),
+        ast::Item::Union(item) => item.name().map(|name| name.text().to_string()),
+        _ => None,
+    }));
+    names.extend(
+        file.syntax()
+            .descendants()
+            .filter_map(ast::PathType::cast)
+            .filter_map(|path_type| path_type.path())
+            .filter_map(|path| {
+                let segments = simple_segments(&path)?;
+                (segments.len() == 1).then(|| segments[0].clone())
+            }),
+    );
+    names.extend(
+        file.items()
+            .filter_map(|item| match item {
+                ast::Item::Use(import) => Some(import.syntax().text().to_string()),
+                _ => None,
+            })
+            .flat_map(|text| {
+                text.split(|character: char| !character.is_alphanumeric() && character != '_')
+                    .filter(|word| word.chars().next().is_some_and(char::is_uppercase))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>(),
+    );
+    names
 }
 
 fn module_aliases(file: &ast::SourceFile) -> BTreeMap<String, String> {
@@ -358,10 +405,18 @@ fn module_aliases(file: &ast::SourceFile) -> BTreeMap<String, String> {
             .unwrap_or_default()
             .trim_end_matches(';');
         if let Some((prefix, group)) = import.split_once("::{") {
-            if group.split([',', '}']).any(|entry| entry.trim() == "self")
-                && let Some(leaf) = prefix.rsplit("::").next()
-            {
-                aliases.insert(leaf.to_owned(), prefix.to_owned());
+            for entry in top_level_group_entries(group.trim_end_matches('}')) {
+                let entry = entry.trim();
+                if entry == "self" {
+                    if let Some(leaf) = prefix.rsplit("::").next() {
+                        aliases.insert(leaf.to_owned(), prefix.to_owned());
+                    }
+                } else if !entry.contains(['{', ':']) {
+                    let (path, binding) = entry
+                        .rsplit_once(" as ")
+                        .map_or((entry, entry), |(path, alias)| (path.trim(), alias.trim()));
+                    aliases.insert(binding.to_owned(), format!("{prefix}::{path}"));
+                }
             }
         } else if let Some((path, alias)) = import.rsplit_once(" as ") {
             aliases.insert(alias.trim().to_owned(), path.trim().to_owned());
@@ -372,6 +427,25 @@ fn module_aliases(file: &ast::SourceFile) -> BTreeMap<String, String> {
         }
     }
     aliases
+}
+
+fn top_level_group_entries(group: &str) -> Vec<&str> {
+    let mut entries = Vec::new();
+    let mut depth = 0_u32;
+    let mut start = 0;
+    for (index, character) in group.char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                entries.push(&group[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    entries.push(&group[start..]);
+    entries
 }
 
 fn canonical_path(segments: &[String], aliases: &BTreeMap<String, String>) -> String {
@@ -403,8 +477,39 @@ fn simple_segments(path: &ast::Path) -> Option<Vec<String>> {
 fn exempt_root(root: &str) -> bool {
     matches!(
         root,
-        "std" | "core" | "alloc" | "proc_macro" | "crate" | "self" | "super"
+        "std" | "core" | "alloc" | "proc_macro" | "crate" | "self" | "super" | "Self"
     )
+}
+
+fn exempt_path_root(root: &str, aliases: &BTreeMap<String, String>) -> bool {
+    exempt_root(root)
+        || aliases
+            .get(root)
+            .is_some_and(|path| path.split("::").next().is_some_and(exempt_root))
+}
+
+fn generic_type_parameter(node: &SyntaxNode, root: &str) -> bool {
+    node.ancestors().any(|ancestor| {
+        let parameters = Fn::cast(ancestor.clone())
+            .and_then(|item| item.generic_param_list())
+            .or_else(|| Impl::cast(ancestor.clone()).and_then(|item| item.generic_param_list()))
+            .or_else(|| Struct::cast(ancestor.clone()).and_then(|item| item.generic_param_list()))
+            .or_else(|| Enum::cast(ancestor.clone()).and_then(|item| item.generic_param_list()))
+            .or_else(|| Trait::cast(ancestor.clone()).and_then(|item| item.generic_param_list()))
+            .or_else(|| {
+                TypeAlias::cast(ancestor.clone()).and_then(|item| item.generic_param_list())
+            })
+            .or_else(|| Union::cast(ancestor).and_then(|item| item.generic_param_list()));
+        parameters.is_some_and(|parameters| {
+            parameters.generic_params().any(|parameter| {
+                matches!(
+                    parameter,
+                    ast::GenericParam::TypeParam(type_parameter)
+                        if type_parameter.name().is_some_and(|name| name.text() == root)
+                )
+            })
+        })
+    })
 }
 
 fn physical_module(relative: &Path) -> Option<Vec<String>> {
@@ -421,6 +526,11 @@ fn physical_module(relative: &Path) -> Option<Vec<String>> {
     match file.as_str() {
         "lib.rs" | "main.rs" => {}
         "mod.rs" => {}
+        "crate_root_tests.rs" => module.push("tests".to_owned()),
+        _ if file.ends_with("_tests.rs") => {
+            module.push(file.trim_end_matches("_tests.rs").to_owned());
+            module.push("tests".to_owned());
+        }
         _ => module.push(file.trim_end_matches(".rs").to_owned()),
     }
     Some(module)

@@ -18,6 +18,7 @@ pub(crate) struct TestLayoutAnalysis {
     pub(crate) replacements: BTreeMap<PathBuf, String>,
     pub(crate) creations: BTreeMap<PathBuf, String>,
     pub(crate) deletions: BTreeSet<PathBuf>,
+    pub(crate) moves: BTreeMap<PathBuf, PathBuf>,
 }
 
 pub(crate) fn analyze_file_suffix(
@@ -137,8 +138,9 @@ pub(crate) fn analyze_file_suffix(
         }
         analysis
             .creations
-            .insert(destination, input.source.to_owned());
+            .insert(destination.clone(), input.source.to_owned());
         analysis.deletions.insert(input.path.to_path_buf());
+        analysis.moves.insert(input.path.to_path_buf(), destination);
         analysis.diagnostics.push(Diagnostic::new(
             "tests.file-suffix",
             "files containing test functions must end in `_tests.rs`",
