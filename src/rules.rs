@@ -1,14 +1,16 @@
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::Path;
 
-use ra_ap_syntax::ast::{self, AstNode, HasModuleItem, HasName, HasVisibility};
+use pulldown_cmark::{BrokenLink, Event, Options, Parser, Tag, TagEnd};
+use ra_ap_syntax::ast::{self, AstNode, AstToken, HasModuleItem, HasName, HasVisibility};
 use ra_ap_syntax::{Edition, SourceFile};
 use toml_edit::{DocumentMut, Item, Table};
 
 use crate::config::Config;
 use crate::diagnostic::Diagnostic;
 
-static RULES: [&dyn Rule; 2] = [&ItemOrder, &BlankLines];
+static RULES: [&dyn Rule; 3] = [&RustdocTypeLinks, &ItemOrder, &BlankLines];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Edit {
@@ -97,6 +99,28 @@ trait Rule: Sync {
 struct ItemOrder;
 
 struct BlankLines;
+
+struct RustdocTypeLinks;
+
+impl Rule for RustdocTypeLinks {
+    fn id(&self) -> &'static str {
+        "rustdoc.type-links"
+    }
+
+    fn check(&self, context: &RuleContext<'_>, findings: &mut Vec<Finding>) {
+        let known = known_type_names(&context.file);
+        for comment in context
+            .file
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter_map(ast::Comment::cast)
+            .filter(ast::Comment::is_doc)
+        {
+            check_doc_comment(context, &comment, &known, findings);
+        }
+    }
+}
 
 impl Rule for ItemOrder {
     fn id(&self) -> &'static str {
@@ -333,6 +357,185 @@ fn has_empty_line(separator: &str) -> bool {
         .any(|line| line.trim_matches([' ', '\t', '\r']).is_empty())
 }
 
+fn check_doc_comment(
+    context: &RuleContext<'_>,
+    comment: &ast::Comment,
+    known: &HashSet<String>,
+    findings: &mut Vec<Finding>,
+) {
+    let Some((content, prefix_offset)) = comment.doc_comment() else {
+        return;
+    };
+    let callback = |link: BrokenLink<'_>| {
+        Some((
+            pulldown_cmark::CowStr::from(link.reference.to_string()),
+            pulldown_cmark::CowStr::Borrowed(""),
+        ))
+    };
+    let parser = Parser::new_with_broken_link_callback(content, Options::empty(), Some(callback))
+        .into_offset_iter();
+    let mut links = Vec::new();
+    for (event, range) in parser {
+        match event {
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                links.push((dest_url.into_string(), range.start));
+            }
+            Event::End(TagEnd::Link) => {
+                let Some((destination, start)) = links.pop() else {
+                    continue;
+                };
+                let range = start..range.end;
+                check_doc_link(
+                    context,
+                    comment,
+                    prefix_offset,
+                    content,
+                    &destination,
+                    range,
+                    known,
+                    findings,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_doc_link(
+    context: &RuleContext<'_>,
+    comment: &ast::Comment,
+    prefix_offset: ra_ap_syntax::TextSize,
+    content: &str,
+    destination: &str,
+    markdown_range: Range<usize>,
+    known: &HashSet<String>,
+    findings: &mut Vec<Finding>,
+) {
+    let Some(target) = type_link_target(destination) else {
+        return;
+    };
+    if target.contains("::")
+        || known.contains(target)
+        || generic_parameter(target)
+        || primitive(target)
+    {
+        return;
+    }
+    let comment_start = usize::from(comment.syntax().text_range().start());
+    let content_start = comment_start + usize::from(prefix_offset);
+    let range = content_start + markdown_range.start..content_start + markdown_range.end;
+    let raw = &content[markdown_range];
+    let replacement = unlinked_display(raw, target);
+    findings.push(Finding {
+        diagnostic: Diagnostic::new(
+            "rustdoc.type-links",
+            format!("unresolved Rustdoc type link `{target}` must not be a link"),
+            context.relative.to_path_buf(),
+            context.source,
+            range.start,
+            range.end,
+        ),
+        edits: vec![Edit { range, replacement }],
+    });
+}
+
+fn known_type_names(file: &ast::SourceFile) -> HashSet<String> {
+    let mut names: HashSet<_> = [
+        "Option", "Result", "String", "Vec", "Box", "Cow", "Rc", "Arc", "Pin",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    for item in file.items() {
+        let name = match &item {
+            ast::Item::Enum(node) => node.name(),
+            ast::Item::Struct(node) => node.name(),
+            ast::Item::Trait(node) => node.name(),
+            ast::Item::TypeAlias(node) => node.name(),
+            ast::Item::Union(node) => node.name(),
+            _ => None,
+        };
+        if let Some(name) = name {
+            names.insert(name.text().to_string());
+        }
+        if let ast::Item::Use(node) = item {
+            let text = node.syntax().text().to_string();
+            names.extend(
+                text.split(|character: char| !character.is_alphanumeric() && character != '_')
+                    .filter(|word| word.chars().next().is_some_and(char::is_uppercase))
+                    .map(str::to_owned),
+            );
+        }
+    }
+    names
+}
+
+fn type_link_target(destination: &str) -> Option<&str> {
+    if destination.contains('/')
+        || destination.contains('#')
+        || destination.ends_with("()")
+        || destination.starts_with("http:")
+        || destination.starts_with("https:")
+    {
+        return None;
+    }
+    let destination = destination.trim_matches('`');
+    let (disambiguator, target) = destination
+        .split_once('@')
+        .map_or((None, destination), |(kind, target)| (Some(kind), target));
+    if disambiguator.is_some_and(|kind| matches!(kind, "fn" | "macro" | "mod" | "const" | "static"))
+    {
+        return None;
+    }
+    let leaf = target.rsplit("::").next()?;
+    let first = leaf.chars().next()?;
+    (first.is_uppercase() || primitive(leaf)).then_some(target)
+}
+
+fn primitive(name: &str) -> bool {
+    matches!(
+        name,
+        "bool"
+            | "char"
+            | "str"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f32"
+            | "f64"
+    )
+}
+
+fn generic_parameter(name: &str) -> bool {
+    name.len() <= 2 && name.chars().all(char::is_uppercase)
+}
+
+fn unlinked_display(raw: &str, target: &str) -> String {
+    let display = raw
+        .strip_prefix('[')
+        .and_then(|value| value.split_once(']'))
+        .map_or(target, |(display, _)| display);
+    let display = display
+        .split_once('@')
+        .map_or(display, |(_, value)| value)
+        .trim_matches('`');
+    if display == target {
+        format!("`{display}`")
+    } else {
+        display.to_owned()
+    }
+}
+
 fn sort_dependency_table(table: &mut Table) -> Option<Range<usize>> {
     let entries: Vec<_> = table
         .iter()
@@ -435,6 +638,28 @@ anyhow = "1"
 # external comment
 serde = { version = "1", features = ["derive", "derive"] }
 "#
+        );
+    }
+
+    #[test]
+    fn unlinks_unresolved_rustdoc_types_and_keeps_known_types() {
+        let (_directory, config) = config();
+        let source = "pub struct Card;\n\n/// Uses [Card], [Widget], [the other][Other], and [`Missing`].\npub fn draw() {}\n";
+        let findings = check(&config, Path::new("src/lib.rs"), source);
+        let mut edits: Vec<_> = findings
+            .into_iter()
+            .filter(|finding| finding.diagnostic.rule_id == "rustdoc.type-links")
+            .flat_map(|finding| finding.edits)
+            .collect();
+        assert_eq!(edits.len(), 3);
+        edits.sort_by_key(|edit| edit.range.start);
+        let mut fixed = source.to_owned();
+        for edit in edits.into_iter().rev() {
+            fixed.replace_range(edit.range, &edit.replacement);
+        }
+        assert_eq!(
+            fixed,
+            "pub struct Card;\n\n/// Uses [Card], `Widget`, the other, and `Missing`.\npub fn draw() {}\n"
         );
     }
 }

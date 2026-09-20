@@ -21,6 +21,7 @@ clap = { version = "4.5.48", features = ["derive"] }
 fs2 = "0.4.3"
 globset = "0.4.16"
 ignore = "0.4.23"
+pulldown-cmark = { version = "0.13.0", default-features = false }
 ra_ap_syntax = "=0.0.350"
 rayon = "1.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
