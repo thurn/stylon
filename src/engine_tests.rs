@@ -183,3 +183,65 @@ fn fix_extracts_tests_from_a_cargo_entry_file() {
         std::process::ExitCode::SUCCESS
     );
 }
+
+#[test]
+fn baseline_validation_failure_writes_no_source_changes() {
+    let directory = tempdir().expect("temporary directory");
+    fs::create_dir(directory.path().join("src")).expect("source directory");
+    fs::write(
+        directory.path().join("stylon.toml"),
+        "version = 1\n[validation]\ncommand = [\"false\"]\n",
+    )
+    .expect("configuration");
+    fs::write(
+        directory.path().join("Cargo.toml"),
+        "[package]\nname='failure_fixture'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .expect("manifest");
+    let source_path = directory.path().join("src/lib.rs");
+    let original = b"fn private() {}\npub struct Public;\n";
+    fs::write(&source_path, original).expect("source");
+    let arguments = [
+        OsString::from("stylon"),
+        OsString::from("--fix"),
+        directory.path().as_os_str().to_owned(),
+    ];
+
+    assert_eq!(
+        super::super::run(arguments),
+        std::process::ExitCode::from(2)
+    );
+    assert_eq!(fs::read(source_path).expect("unchanged source"), original);
+    assert!(!directory.path().join(".stylon-transaction").exists());
+}
+
+#[test]
+fn post_fix_validation_failure_restores_source_changes() {
+    let directory = tempdir().expect("temporary directory");
+    fs::create_dir(directory.path().join("src")).expect("source directory");
+    fs::write(
+        directory.path().join("stylon.toml"),
+        "version = 1\n[validation]\ncommand = [\"sh\", \"-c\", \"if test -f validation-marker; then exit 1; else touch validation-marker; fi\"]\n",
+    )
+    .expect("configuration");
+    fs::write(
+        directory.path().join("Cargo.toml"),
+        "[package]\nname='rollback_fixture'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .expect("manifest");
+    let source_path = directory.path().join("src/lib.rs");
+    let original = b"fn private() {}\npub struct Public;\n";
+    fs::write(&source_path, original).expect("source");
+    let arguments = [
+        OsString::from("stylon"),
+        OsString::from("--fix"),
+        directory.path().as_os_str().to_owned(),
+    ];
+
+    assert_eq!(
+        super::super::run(arguments),
+        std::process::ExitCode::from(2)
+    );
+    assert_eq!(fs::read(source_path).expect("restored source"), original);
+    assert!(!directory.path().join(".stylon-transaction").exists());
+}

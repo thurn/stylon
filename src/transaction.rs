@@ -28,6 +28,11 @@ pub(crate) fn recover_if_needed(config: &Config, fix: bool) -> Result<(), Operat
     if !transaction.exists() {
         return Ok(());
     }
+    let journal = read_journal(&transaction)?;
+    if journal.state == JournalState::Committed {
+        let _lock = ProjectLock::acquire(&config.root)?;
+        return remove_transaction(&transaction, "committed transaction");
+    }
     if !fix {
         return Err(error(
             "recovery",
@@ -37,14 +42,7 @@ pub(crate) fn recover_if_needed(config: &Config, fix: bool) -> Result<(), Operat
     }
     let _lock = ProjectLock::acquire(&config.root)?;
     restore_transaction(&config.root, &transaction)?;
-    fs::remove_dir_all(&transaction).map_err(|source| {
-        error(
-            "recovery",
-            format!("cannot remove recovered transaction: {source}"),
-            vec![PathBuf::from(TRANSACTION_DIRECTORY)],
-        )
-    })?;
-    Ok(())
+    remove_transaction(&transaction, "recovered transaction")
 }
 
 pub(crate) fn apply(
@@ -65,45 +63,59 @@ pub(crate) fn apply(
     let _lock = ProjectLock::acquire(&config.root)?;
     verify_inventory(inventory)?;
     verify_changes(changes)?;
-    validate(config, "baseline-validation")?;
+
+    let transaction = config.root.join(TRANSACTION_DIRECTORY);
+    prepare_journal(&config.root, &transaction, changes, inventory)?;
+    if let Err(validation_error) = validate(config, "baseline-validation") {
+        if let Err(modification) = verify_inventory(inventory) {
+            return Err(error(
+                "baseline-validation",
+                format!(
+                    "baseline validation changed project inputs; recovery data was retained: {}",
+                    modification.message
+                ),
+                modification.paths,
+            ));
+        }
+        remove_transaction(&transaction, "baseline journal")?;
+        return Err(validation_error);
+    }
     verify_inventory(inventory)?;
     verify_changes(changes)?;
 
-    let transaction = config.root.join(TRANSACTION_DIRECTORY);
-    prepare_journal(&config.root, &transaction, changes)?;
     for change in changes {
         atomic_replace(change)?;
     }
+    write_journal_state(&transaction, JournalState::Applied)?;
 
     if let Err(validation_error) = validate(config, "validation") {
         match restore_transaction(&config.root, &transaction) {
             Ok(()) => {
-                fs::remove_dir_all(&transaction).map_err(|source| {
-                    error(
-                        "recovery",
-                        format!("validation failed and cleanup failed: {source}"),
-                        vec![PathBuf::from(TRANSACTION_DIRECTORY)],
-                    )
-                })?;
+                remove_transaction(&transaction, "restored transaction")?;
                 return Err(validation_error);
             }
             Err(recovery_error) => return Err(recovery_error),
         }
     }
 
-    fs::remove_dir_all(&transaction).map_err(|source| {
-        error(
-            "filesystem",
-            format!("fix succeeded but transaction cleanup failed: {source}"),
-            vec![PathBuf::from(TRANSACTION_DIRECTORY)],
-        )
-    })?;
-    Ok(())
+    write_journal_state(&transaction, JournalState::Committed)?;
+    remove_transaction(&transaction, "committed transaction")
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Journal {
+    #[serde(default)]
+    state: JournalState,
     entries: Vec<JournalEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum JournalState {
+    #[default]
+    Planned,
+    Applied,
+    Committed,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -119,6 +131,7 @@ fn prepare_journal(
     root: &Path,
     transaction: &Path,
     changes: &[Change],
+    inventory: &[(PathBuf, Vec<u8>)],
 ) -> Result<(), OperationalError> {
     fs::create_dir(transaction).map_err(|source| {
         error(
@@ -129,8 +142,22 @@ fn prepare_journal(
     })?;
     set_private_permissions(transaction)?;
 
-    let mut entries = Vec::with_capacity(changes.len());
-    for (index, change) in changes.iter().enumerate() {
+    let mut journal_changes = changes.to_vec();
+    journal_changes.extend(
+        inventory
+            .iter()
+            .filter(|(path, _)| !changes.iter().any(|change| change.path == *path))
+            .map(|(path, bytes)| Change {
+                path: path.clone(),
+                original: Some(bytes.clone()),
+                replacement: Some(bytes.clone()),
+                permissions: fs::metadata(path)
+                    .ok()
+                    .map(|metadata| metadata.permissions()),
+            }),
+    );
+    let mut entries = Vec::with_capacity(journal_changes.len());
+    for (index, change) in journal_changes.iter().enumerate() {
         let original = change
             .original
             .as_ref()
@@ -156,7 +183,11 @@ fn prepare_journal(
             mode: change.permissions.as_ref().and_then(permission_mode),
         });
     }
-    let journal = serde_json::to_vec(&Journal { entries }).map_err(|source| {
+    let journal = serde_json::to_vec(&Journal {
+        state: JournalState::Planned,
+        entries,
+    })
+    .map_err(|source| {
         error(
             "filesystem",
             format!("cannot serialize transaction journal: {source}"),
@@ -169,21 +200,7 @@ fn prepare_journal(
 }
 
 fn restore_transaction(root: &Path, transaction: &Path) -> Result<(), OperationalError> {
-    let journal_path = transaction.join("journal.json");
-    let journal: Journal = serde_json::from_slice(&fs::read(&journal_path).map_err(|source| {
-        error(
-            "recovery",
-            format!("cannot read transaction journal: {source}"),
-            vec![PathBuf::from(TRANSACTION_DIRECTORY)],
-        )
-    })?)
-    .map_err(|source| {
-        error(
-            "recovery",
-            format!("cannot parse transaction journal: {source}"),
-            vec![PathBuf::from(TRANSACTION_DIRECTORY)],
-        )
-    })?;
+    let journal = read_journal(transaction)?;
 
     for entry in journal.entries {
         let path = root.join(&entry.relative);
@@ -253,6 +270,57 @@ fn restore_transaction(root: &Path, transaction: &Path) -> Result<(), Operationa
         }
     }
     Ok(())
+}
+
+fn read_journal(transaction: &Path) -> Result<Journal, OperationalError> {
+    let journal_path = transaction.join("journal.json");
+    serde_json::from_slice(&fs::read(&journal_path).map_err(|source| {
+        error(
+            "recovery",
+            format!("cannot read transaction journal: {source}"),
+            vec![PathBuf::from(TRANSACTION_DIRECTORY)],
+        )
+    })?)
+    .map_err(|source| {
+        error(
+            "recovery",
+            format!("cannot parse transaction journal: {source}"),
+            vec![PathBuf::from(TRANSACTION_DIRECTORY)],
+        )
+    })
+}
+
+fn write_journal_state(transaction: &Path, state: JournalState) -> Result<(), OperationalError> {
+    let mut journal = read_journal(transaction)?;
+    journal.state = state;
+    let bytes = serde_json::to_vec(&journal).map_err(|source| {
+        error(
+            "filesystem",
+            format!("cannot serialize transaction journal: {source}"),
+            vec![PathBuf::from(TRANSACTION_DIRECTORY)],
+        )
+    })?;
+    let temporary = transaction.join("journal.next");
+    durable_write(&temporary, &bytes, None)?;
+    fs::rename(&temporary, transaction.join("journal.json")).map_err(|source| {
+        error(
+            "filesystem",
+            format!("cannot update transaction journal: {source}"),
+            vec![PathBuf::from(TRANSACTION_DIRECTORY)],
+        )
+    })?;
+    sync_directory(transaction)
+}
+
+fn remove_transaction(transaction: &Path, description: &str) -> Result<(), OperationalError> {
+    fs::remove_dir_all(transaction).map_err(|source| {
+        error(
+            "filesystem",
+            format!("cannot remove {description}: {source}"),
+            vec![PathBuf::from(TRANSACTION_DIRECTORY)],
+        )
+    })?;
+    sync_directory(transaction.parent().expect("transaction has a parent"))
 }
 
 fn atomic_replace(change: &Change) -> Result<(), OperationalError> {
