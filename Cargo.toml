@@ -1,0 +1,15 @@
+[package]
+name = "stylon"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "A deterministic Rust project style checker and fixer"
+license = "MIT"
+repository = "https://github.com/thurn/stylon"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[[bin]]
+name = "stylon"
+path = "src/main.rs"
