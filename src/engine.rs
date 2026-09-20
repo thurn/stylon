@@ -21,6 +21,23 @@ use toml::Value;
 
 pub(crate) fn run(cli: &Cli) -> ExitCode {
     let started = Instant::now();
+    if let Ok(metadata) = fs::symlink_metadata(&cli.path)
+        && metadata.file_type().is_symlink()
+    {
+        return finish(
+            cli,
+            Vec::new(),
+            vec![OperationalError {
+                category: "filesystem",
+                message: format!(
+                    "the explicitly selected path may not be a symbolic link: {}",
+                    cli.path.display()
+                ),
+                paths: vec![cli.path.clone()],
+            }],
+            Summary::default(),
+        );
+    }
     let config = match Config::load(&cli.path, cli.config.as_deref()) {
         Ok(config) => config,
         Err(error) => return finish(cli, Vec::new(), vec![error], Summary::default()),

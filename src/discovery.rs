@@ -43,6 +43,16 @@ pub(crate) fn discover(
         match result {
             Ok(entry) if entry.file_type().is_some_and(|kind| kind.is_file()) => {
                 let path = entry.into_path();
+                if path.file_name().is_some_and(|name| name == "stylon.toml")
+                    && config.config_path.as_ref() != Some(&path)
+                {
+                    errors.push(error(
+                        "configuration",
+                        "nested stylon.toml files are not allowed",
+                        &config.relative(&path),
+                    ));
+                    continue;
+                }
                 if is_source(&path) {
                     match selected_file(config, path) {
                         Ok(Some(path)) => files.push(path),
@@ -86,6 +96,22 @@ fn selected_file(config: &Config, path: PathBuf) -> Result<Option<PathBuf>, Vec<
         )]);
     }
     let relative = config.relative(&path);
+    let nested_configs: Vec<_> = path
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .take_while(|ancestor| *ancestor != config.root)
+        .map(|ancestor| ancestor.join("stylon.toml"))
+        .filter(|candidate| candidate.is_file() && config.config_path.as_ref() != Some(candidate))
+        .map(|candidate| config.relative(&candidate))
+        .collect();
+    if !nested_configs.is_empty() {
+        return Err(vec![OperationalError {
+            category: "configuration",
+            message: "nested stylon.toml files are not allowed".to_owned(),
+            paths: nested_configs,
+        }]);
+    }
     if config.is_excluded(&relative) || !is_source(&path) {
         return Ok(None);
     }
@@ -135,3 +161,7 @@ fn error(category: &'static str, message: impl Into<String>, path: &Path) -> Ope
         paths: vec![path.to_path_buf()],
     }
 }
+
+#[path = "discovery_tests.rs"]
+#[cfg(test)]
+mod tests;

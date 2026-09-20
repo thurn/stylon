@@ -6,6 +6,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 
 use crate::diagnostic::OperationalError;
+use toml::Value;
 
 pub(crate) const RULE_IDS: &[&str] = &[
     "cargo.dependency-order",
@@ -119,10 +120,17 @@ impl Config {
             .map(|path| read_config(path))
             .transpose()?
             .unwrap_or_default();
-        if file.version != 0 && file.version != 1 {
+        if config_path.is_some() && file.version != 1 {
             return Err(error(
                 "configuration",
-                format!("unsupported configuration version {}", file.version),
+                format!("configuration version must be 1, found {}", file.version),
+                config_path.iter().cloned().collect(),
+            ));
+        }
+        if file.validation.command.as_ref().is_some_and(Vec::is_empty) {
+            return Err(error(
+                "configuration",
+                "validation command may not be empty",
                 config_path.iter().cloned().collect(),
             ));
         }
@@ -238,12 +246,29 @@ fn find_analysis_root(requested: &Path) -> PathBuf {
         requested.parent().expect("file has a parent")
     };
     let ancestors: Vec<_> = start.ancestors().collect();
-    ancestors
-        .iter()
-        .rev()
-        .find(|path| path.join("Cargo.toml").is_file())
-        .or_else(|| ancestors.iter().find(|path| path.join(".git").exists()))
-        .copied()
+    let mut nearest_package = None;
+    for ancestor in &ancestors {
+        let manifest = ancestor.join("Cargo.toml");
+        let Ok(source) = fs::read_to_string(manifest) else {
+            continue;
+        };
+        let Ok(value) = toml::from_str::<Value>(&source) else {
+            continue;
+        };
+        if value.get("workspace").is_some() {
+            return (*ancestor).to_path_buf();
+        }
+        if nearest_package.is_none() && value.get("package").is_some() {
+            nearest_package = Some(*ancestor);
+        }
+    }
+    nearest_package
+        .or_else(|| {
+            ancestors
+                .iter()
+                .find(|path| path.join(".git").exists())
+                .copied()
+        })
         .unwrap_or(start)
         .to_path_buf()
 }
