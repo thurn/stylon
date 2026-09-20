@@ -90,3 +90,18 @@ fn unlinks_unresolved_rustdoc_types_and_keeps_known_types() {
         "pub struct Card;\n\n/// Uses [Card], `Widget`, the other, and `Missing`.\npub fn draw() {}\n"
     );
 }
+
+#[test]
+fn resolves_reference_definitions_across_doc_comment_lines() {
+    let (_directory, config) = config();
+    let source =
+        "/// Uses [Widget] or [None].\n///\n/// [Widget]: crate::Widget\npub fn draw() {}\n";
+
+    let findings = check(&config, Path::new("src/lib.rs"), source);
+
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding.diagnostic.rule_id != "rustdoc.type-links")
+    );
+}

@@ -11,7 +11,6 @@ use crate::config::Config;
 use crate::diagnostic::Diagnostic;
 use pulldown_cmark::CowStr;
 use ra_ap_syntax::SyntaxNode;
-use ra_ap_syntax::TextSize;
 use ra_ap_syntax::ast::Comment;
 use ra_ap_syntax::ast::Module;
 
@@ -109,6 +108,11 @@ struct BlankLines;
 
 struct RustdocTypeLinks;
 
+struct KnownTypes {
+    names: HashSet<String>,
+    has_local_glob: bool,
+}
+
 impl Rule for RustdocTypeLinks {
     fn id(&self) -> &'static str {
         "rustdoc.type-links"
@@ -116,16 +120,27 @@ impl Rule for RustdocTypeLinks {
 
     fn check(&self, context: &RuleContext<'_>, findings: &mut Vec<Finding>) {
         let known = known_type_names(&context.file);
-        for comment in context
+        let comments: Vec<_> = context
             .file
             .syntax()
             .descendants_with_tokens()
             .filter_map(|element| element.into_token())
             .filter_map(ast::Comment::cast)
             .filter(ast::Comment::is_doc)
-        {
-            check_doc_comment(context, &comment, &known, findings);
+            .collect();
+        let mut block = Vec::new();
+        for comment in comments {
+            if block.last().is_some_and(|previous: &Comment| {
+                let previous_end = usize::from(previous.syntax().text_range().end());
+                let start = usize::from(comment.syntax().text_range().start());
+                context.source[previous_end..start].matches('\n').count() > 1
+            }) {
+                check_doc_block(context, &block, &known, findings);
+                block.clear();
+            }
+            block.push(comment);
         }
+        check_doc_block(context, &block, &known, findings);
     }
 }
 
@@ -364,22 +379,38 @@ fn has_empty_line(separator: &str) -> bool {
         .any(|line| line.trim_matches([' ', '\t', '\r']).is_empty())
 }
 
-fn check_doc_comment(
+fn check_doc_block(
     context: &RuleContext<'_>,
-    comment: &Comment,
-    known: &HashSet<String>,
+    comments: &[Comment],
+    known: &KnownTypes,
     findings: &mut Vec<Finding>,
 ) {
-    let Some((content, prefix_offset)) = comment.doc_comment() else {
+    if comments.is_empty() {
         return;
-    };
+    }
+    let mut markdown = String::new();
+    let mut segments = Vec::new();
+    for comment in comments {
+        let Some((content, prefix_offset)) = comment.doc_comment() else {
+            continue;
+        };
+        let markdown_start = markdown.len();
+        markdown.push_str(content);
+        segments.push(DocSegment {
+            markdown_start,
+            markdown_end: markdown.len(),
+            source_start: usize::from(comment.syntax().text_range().start())
+                + usize::from(prefix_offset),
+        });
+        markdown.push('\n');
+    }
     let callback = |link: BrokenLink<'_>| {
         Some((
             pulldown_cmark::CowStr::from(link.reference.to_string()),
             CowStr::Borrowed(""),
         ))
     };
-    let parser = Parser::new_with_broken_link_callback(content, Options::empty(), Some(callback))
+    let parser = Parser::new_with_broken_link_callback(&markdown, Options::empty(), Some(callback))
         .into_offset_iter();
     let mut links = Vec::new();
     for (event, range) in parser {
@@ -394,9 +425,8 @@ fn check_doc_comment(
                 let range = start..range.end;
                 check_doc_link(
                     context,
-                    comment,
-                    prefix_offset,
-                    content,
+                    &segments,
+                    &markdown,
                     &destination,
                     range,
                     known,
@@ -408,30 +438,39 @@ fn check_doc_comment(
     }
 }
 
+#[derive(Clone, Debug)]
+struct DocSegment {
+    markdown_start: usize,
+    markdown_end: usize,
+    source_start: usize,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_doc_link(
     context: &RuleContext<'_>,
-    comment: &Comment,
-    prefix_offset: TextSize,
+    segments: &[DocSegment],
     content: &str,
     destination: &str,
     markdown_range: Range<usize>,
-    known: &HashSet<String>,
+    known: &KnownTypes,
     findings: &mut Vec<Finding>,
 ) {
     let Some(target) = type_link_target(destination) else {
         return;
     };
+    let base = target.split('<').next().unwrap_or(target);
     if target.contains("::")
-        || known.contains(target)
+        || known.names.contains(target)
+        || known.names.contains(base)
+        || known.has_local_glob
         || generic_parameter(target)
         || primitive(target)
     {
         return;
     }
-    let comment_start = usize::from(comment.syntax().text_range().start());
-    let content_start = comment_start + usize::from(prefix_offset);
-    let range = content_start + markdown_range.start..content_start + markdown_range.end;
+    let Some(range) = source_markdown_range(segments, &markdown_range) else {
+        return;
+    };
     let raw = &content[markdown_range];
     let replacement = unlinked_display(raw, target);
     findings.push(Finding {
@@ -447,13 +486,61 @@ fn check_doc_link(
     });
 }
 
-fn known_type_names(file: &ast::SourceFile) -> HashSet<String> {
+fn source_markdown_range(
+    segments: &[DocSegment],
+    markdown_range: &Range<usize>,
+) -> Option<Range<usize>> {
+    let segment = segments.iter().find(|segment| {
+        markdown_range.start >= segment.markdown_start && markdown_range.end <= segment.markdown_end
+    })?;
+    Some(
+        segment.source_start + markdown_range.start - segment.markdown_start
+            ..segment.source_start + markdown_range.end - segment.markdown_start,
+    )
+}
+
+fn known_type_names(file: &ast::SourceFile) -> KnownTypes {
     let mut names: HashSet<_> = [
-        "Option", "Result", "String", "Vec", "Box", "Cow", "Rc", "Arc", "Pin",
+        "Arc",
+        "AsMut",
+        "AsRef",
+        "Box",
+        "Clone",
+        "Copy",
+        "Cow",
+        "Default",
+        "Eq",
+        "From",
+        "Into",
+        "Option",
+        "Ord",
+        "PartialEq",
+        "PartialOrd",
+        "Pin",
+        "Rc",
+        "Result",
+        "Send",
+        "Sized",
+        "String",
+        "Sync",
+        "ToOwned",
+        "ToString",
+        "TryFrom",
+        "TryInto",
+        "Unpin",
+        "Vec",
     ]
     .into_iter()
     .map(str::to_owned)
     .collect();
+    let local_modules: HashSet<_> = file
+        .items()
+        .filter_map(|item| match item {
+            ast::Item::Module(module) => module.name().map(|name| name.text().to_string()),
+            _ => None,
+        })
+        .collect();
+    let mut has_local_glob = false;
     for item in file.items() {
         let name = match &item {
             ast::Item::Enum(node) => node.name(),
@@ -468,6 +555,17 @@ fn known_type_names(file: &ast::SourceFile) -> HashSet<String> {
         }
         if let ast::Item::Use(node) = item {
             let text = node.syntax().text().to_string();
+            if text.contains("::*") {
+                let root = text
+                    .trim()
+                    .trim_start_matches("pub ")
+                    .trim_start_matches("use ")
+                    .split("::")
+                    .next()
+                    .unwrap_or_default();
+                has_local_glob |=
+                    matches!(root, "crate" | "self" | "super") || local_modules.contains(root);
+            }
             names.extend(
                 text.split(|character: char| !character.is_alphanumeric() && character != '_')
                     .filter(|word| word.chars().next().is_some_and(char::is_uppercase))
@@ -475,7 +573,20 @@ fn known_type_names(file: &ast::SourceFile) -> HashSet<String> {
             );
         }
     }
-    names
+    for attribute in file.syntax().descendants().filter_map(ast::Attr::cast) {
+        let text = attribute.syntax().text().to_string();
+        if text.trim_start().starts_with("#[enum_kind(") {
+            names.extend(
+                text.split(|character: char| !character.is_alphanumeric() && character != '_')
+                    .filter(|word| word.chars().next().is_some_and(char::is_uppercase))
+                    .map(str::to_owned),
+            );
+        }
+    }
+    KnownTypes {
+        names,
+        has_local_glob,
+    }
 }
 
 fn type_link_target(destination: &str) -> Option<&str> {
@@ -496,6 +607,9 @@ fn type_link_target(destination: &str) -> Option<&str> {
         return None;
     }
     let leaf = target.rsplit("::").next()?;
+    if matches!(leaf, "Some" | "None" | "Ok" | "Err") {
+        return None;
+    }
     let first = leaf.chars().next()?;
     (first.is_uppercase() || primitive(leaf)).then_some(target)
 }
