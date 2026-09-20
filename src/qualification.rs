@@ -1,0 +1,559 @@
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::{Component, Path};
+
+use ra_ap_syntax::ast::{self, AstNode, HasModuleItem, HasName};
+use ra_ap_syntax::{Edition, SourceFile};
+
+use crate::config::Config;
+use crate::diagnostic::Diagnostic;
+use crate::rules::{Edit, Finding};
+use ra_ap_syntax::SyntaxNode;
+
+pub(crate) fn check(config: &Config, relative: &Path, source: &str) -> Vec<Finding> {
+    let parsed = SourceFile::parse(source, Edition::Edition2024);
+    let file = parsed.tree();
+    let bindings = imported_type_names(&file);
+    let aliases = module_aliases(&file);
+    let mut candidates = Vec::new();
+    if config.rule_enabled("path.type-qualification", relative) {
+        collect_type_paths(source, &file, &bindings, &aliases, &mut candidates);
+    }
+    collect_expression_paths(
+        config,
+        relative,
+        &file,
+        &bindings,
+        &aliases,
+        source,
+        &mut candidates,
+    );
+    if config.rule_enabled("imports.absolute-crate-path", relative) {
+        collect_relative_imports(relative, &file, &mut candidates);
+    }
+    remove_type_collisions(&mut candidates);
+    candidates.sort_by_key(|candidate| candidate.range.start);
+    candidates.dedup_by(|left, right| left.range == right.range);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut edits: Vec<_> = candidates
+        .iter()
+        .map(|candidate| Edit {
+            range: candidate.range.clone(),
+            replacement: candidate.replacement.clone(),
+        })
+        .collect();
+    let imports: BTreeSet<_> = candidates
+        .iter()
+        .filter_map(|candidate| candidate.import.clone())
+        .collect();
+    for (insertion, imports) in group_imports(imports) {
+        let text = imports
+            .into_iter()
+            .filter(|import| !has_import_near(source, insertion, &import.path))
+            .map(|import| {
+                if import.cfg_test {
+                    format!(
+                        "{}#[cfg(test)]\n{}use {};\n",
+                        import.indent, import.indent, import.path
+                    )
+                } else {
+                    format!("{}use {};\n", import.indent, import.path)
+                }
+            })
+            .collect::<String>();
+        if text.is_empty() {
+            continue;
+        }
+        edits.push(Edit {
+            range: insertion..insertion,
+            replacement: text,
+        });
+    }
+
+    candidates
+        .into_iter()
+        .enumerate()
+        .map(|(index, candidate)| Finding {
+            diagnostic: Diagnostic::new(
+                candidate.rule_id,
+                candidate.message,
+                relative.to_path_buf(),
+                source,
+                candidate.range.start,
+                candidate.range.end,
+            ),
+            edits: if index == 0 {
+                std::mem::take(&mut edits)
+            } else {
+                Vec::new()
+            },
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+struct Candidate {
+    rule_id: &'static str,
+    message: &'static str,
+    range: std::ops::Range<usize>,
+    replacement: String,
+    import: Option<PlannedImport>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PlannedImport {
+    path: String,
+    cfg_test: bool,
+    insertion: usize,
+    indent: String,
+}
+
+fn collect_type_paths(
+    source: &str,
+    file: &ast::SourceFile,
+    bindings: &HashSet<String>,
+    aliases: &BTreeMap<String, String>,
+    candidates: &mut Vec<Candidate>,
+) {
+    for path_type in file.syntax().descendants().filter_map(ast::PathType::cast) {
+        let Some(path) = path_type.path() else {
+            continue;
+        };
+        let Some(segments) = simple_segments(&path) else {
+            continue;
+        };
+        if segments.len() < 2 || exempt_root(&segments[0]) {
+            continue;
+        }
+        let leaf = segments.last().expect("path has a leaf").clone();
+        if bindings.contains(&leaf) {
+            continue;
+        }
+        candidates.push(Candidate {
+            rule_id: "path.type-qualification",
+            message: "type name must be unqualified",
+            range: text_range(path.syntax()),
+            replacement: leaf,
+            import: Some(PlannedImport {
+                path: canonical_path(&segments, aliases),
+                cfg_test: false,
+                insertion: scoped_import_insertion(file, path.syntax(), source).0,
+                indent: scoped_import_insertion(file, path.syntax(), source).1,
+            }),
+        });
+    }
+}
+
+fn collect_expression_paths(
+    config: &Config,
+    relative: &Path,
+    file: &ast::SourceFile,
+    bindings: &HashSet<String>,
+    aliases: &BTreeMap<String, String>,
+    source: &str,
+    candidates: &mut Vec<Candidate>,
+) {
+    for expression in file.syntax().descendants().filter_map(ast::PathExpr::cast) {
+        let Some(path) = expression.path() else {
+            continue;
+        };
+        let Some(segments) = simple_segments(&path) else {
+            continue;
+        };
+        if segments.len() < 3 || exempt_root(&segments[0]) {
+            continue;
+        }
+        let terminal = segments.last().expect("path has a terminal");
+        let parent = &segments[segments.len() - 2];
+        if bindings.contains(parent) {
+            continue;
+        }
+        let is_call = expression
+            .syntax()
+            .parent()
+            .and_then(ast::CallExpr::cast)
+            .is_some();
+        if parent.chars().next().is_some_and(char::is_uppercase) {
+            if terminal.chars().next().is_some_and(char::is_uppercase)
+                && config.rule_enabled("path.enum-variant-qualification", relative)
+            {
+                add_shortened(
+                    candidates,
+                    "path.enum-variant-qualification",
+                    "enum variant may only be qualified by its enum type",
+                    &path,
+                    &segments,
+                    aliases,
+                    file,
+                    source,
+                );
+            } else if is_call
+                && config.rule_enabled("path.type-qualification", relative)
+                && !matches!(
+                    terminal.as_str(),
+                    "default" | "from" | "try_from" | "from_str" | "from_iter"
+                )
+            {
+                add_shortened(
+                    candidates,
+                    "path.type-qualification",
+                    "associated type name must be unqualified",
+                    &path,
+                    &segments,
+                    aliases,
+                    file,
+                    source,
+                );
+            }
+        } else if is_call && config.rule_enabled("path.function-qualification", relative) {
+            candidates.push(Candidate {
+                rule_id: "path.function-qualification",
+                message: "free function may have at most one module qualifier",
+                range: text_range(path.syntax()),
+                replacement: segments[segments.len() - 2..].join("::"),
+                import: Some(PlannedImport {
+                    path: canonical_path(&segments[..segments.len() - 1], aliases),
+                    cfg_test: false,
+                    insertion: scoped_import_insertion(file, path.syntax(), source).0,
+                    indent: scoped_import_insertion(file, path.syntax(), source).1,
+                }),
+            });
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_shortened(
+    candidates: &mut Vec<Candidate>,
+    rule_id: &'static str,
+    message: &'static str,
+    path: &ast::Path,
+    segments: &[String],
+    aliases: &BTreeMap<String, String>,
+    file: &ast::SourceFile,
+    source: &str,
+) {
+    candidates.push(Candidate {
+        rule_id,
+        message,
+        range: text_range(path.syntax()),
+        replacement: segments[segments.len() - 2..].join("::"),
+        import: Some(PlannedImport {
+            path: canonical_path(&segments[..segments.len() - 1], aliases),
+            cfg_test: false,
+            insertion: scoped_import_insertion(file, path.syntax(), source).0,
+            indent: scoped_import_insertion(file, path.syntax(), source).1,
+        }),
+    });
+}
+
+fn collect_relative_imports(
+    relative: &Path,
+    file: &ast::SourceFile,
+    candidates: &mut Vec<Candidate>,
+) {
+    let Some(physical_module) = physical_module(relative) else {
+        return;
+    };
+    for import in file.syntax().descendants().filter_map(ast::Use::cast) {
+        let syntax = import.syntax().text().to_string();
+        let Some(use_offset) = syntax.find("use ").map(|offset| offset + 4) else {
+            continue;
+        };
+        let path_text = &syntax[use_offset..];
+        let (parents, remainder) = if let Some(remainder) = path_text.strip_prefix("self::") {
+            (0, remainder)
+        } else {
+            let count = path_text
+                .as_bytes()
+                .as_chunks::<7>()
+                .0
+                .iter()
+                .take_while(|chunk| *chunk == b"super::")
+                .count();
+            if count == 0 {
+                continue;
+            }
+            (count, &path_text[count * 7..])
+        };
+        let mut module = physical_module.clone();
+        let mut inline: Vec<_> = import
+            .syntax()
+            .ancestors()
+            .filter_map(ast::Module::cast)
+            .filter_map(|module| module.name().map(|name| name.text().to_string()))
+            .collect();
+        inline.reverse();
+        module.extend(inline);
+        if parents > module.len() {
+            continue;
+        }
+        module.truncate(module.len() - parents);
+        let absolute = if module.is_empty() {
+            format!("crate::{remainder}")
+        } else {
+            format!("crate::{}::{remainder}", module.join("::"))
+        };
+        let node_range = text_range(import.syntax());
+        let start = node_range.start + use_offset;
+        candidates.push(Candidate {
+            rule_id: "imports.absolute-crate-path",
+            message: "imports must use an absolute crate path",
+            range: start..start + path_text.len(),
+            replacement: absolute,
+            import: None,
+        });
+    }
+}
+
+fn remove_type_collisions(candidates: &mut Vec<Candidate>) {
+    let mut imports: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for candidate in candidates.iter() {
+        if candidate.rule_id == "path.type-qualification"
+            && !candidate.replacement.contains("::")
+            && let Some(import) = &candidate.import
+        {
+            imports
+                .entry(candidate.replacement.clone())
+                .or_default()
+                .insert(import.path.clone());
+        }
+    }
+    let collisions: BTreeSet<_> = imports
+        .into_iter()
+        .filter_map(|(leaf, paths)| (paths.len() > 1).then_some(leaf))
+        .collect();
+    candidates.retain(|candidate| {
+        candidate.rule_id != "path.type-qualification"
+            || !collisions.contains(&candidate.replacement)
+    });
+}
+
+fn imported_type_names(file: &ast::SourceFile) -> HashSet<String> {
+    file.items()
+        .filter_map(|item| match item {
+            ast::Item::Use(import) => Some(import.syntax().text().to_string()),
+            _ => None,
+        })
+        .flat_map(|text| {
+            text.split(|character: char| !character.is_alphanumeric() && character != '_')
+                .filter(|word| word.chars().next().is_some_and(char::is_uppercase))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn module_aliases(file: &ast::SourceFile) -> BTreeMap<String, String> {
+    let mut aliases = BTreeMap::new();
+    for import in file.items().filter_map(|item| match item {
+        ast::Item::Use(import) => Some(import.syntax().text().to_string()),
+        _ => None,
+    }) {
+        let import = import
+            .trim()
+            .strip_prefix("use ")
+            .unwrap_or_default()
+            .trim_end_matches(';');
+        if let Some((prefix, group)) = import.split_once("::{") {
+            if group.split([',', '}']).any(|entry| entry.trim() == "self")
+                && let Some(leaf) = prefix.rsplit("::").next()
+            {
+                aliases.insert(leaf.to_owned(), prefix.to_owned());
+            }
+        } else if let Some((path, alias)) = import.rsplit_once(" as ") {
+            aliases.insert(alias.trim().to_owned(), path.trim().to_owned());
+        } else if !import.contains('{')
+            && let Some(leaf) = import.rsplit("::").next()
+        {
+            aliases.insert(leaf.to_owned(), import.to_owned());
+        }
+    }
+    aliases
+}
+
+fn canonical_path(segments: &[String], aliases: &BTreeMap<String, String>) -> String {
+    aliases.get(&segments[0]).map_or_else(
+        || segments.join("::"),
+        |prefix| {
+            if segments.len() == 1 {
+                prefix.clone()
+            } else {
+                format!("{prefix}::{}", segments[1..].join("::"))
+            }
+        },
+    )
+}
+
+fn simple_segments(path: &ast::Path) -> Option<Vec<String>> {
+    let text = path.syntax().text().to_string();
+    if text.contains(['<', '>', '(', ')']) {
+        return None;
+    }
+    let segments: Vec<_> = path
+        .segments()
+        .filter_map(|segment| segment.name_ref())
+        .map(|name| name.text().to_string())
+        .collect();
+    (!segments.is_empty()).then_some(segments)
+}
+
+fn exempt_root(root: &str) -> bool {
+    matches!(
+        root,
+        "std" | "core" | "alloc" | "proc_macro" | "crate" | "self" | "super"
+    )
+}
+
+fn physical_module(relative: &Path) -> Option<Vec<String>> {
+    let components: Vec<_> = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str().map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    let source = components.iter().position(|component| component == "src")?;
+    let mut module = components[source + 1..].to_vec();
+    let file = module.pop()?;
+    match file.as_str() {
+        "lib.rs" | "main.rs" => {}
+        "mod.rs" => {}
+        _ => module.push(file.trim_end_matches(".rs").to_owned()),
+    }
+    Some(module)
+}
+
+fn group_imports(imports: BTreeSet<PlannedImport>) -> BTreeMap<usize, Vec<PlannedImport>> {
+    let mut groups: BTreeMap<usize, Vec<PlannedImport>> = BTreeMap::new();
+    for import in imports {
+        groups.entry(import.insertion).or_default().push(import);
+    }
+    groups
+}
+
+fn has_import_near(source: &str, insertion: usize, path: &str) -> bool {
+    let start = insertion.saturating_sub(4_096);
+    source[start..insertion].contains(&format!("use {path}"))
+}
+
+fn scoped_import_insertion(
+    file: &ast::SourceFile,
+    node: &SyntaxNode,
+    source: &str,
+) -> (usize, String) {
+    if let Some(list) = node
+        .ancestors()
+        .filter_map(ast::Module::cast)
+        .find_map(|module| module.item_list())
+    {
+        let items: Vec<_> = list.items().collect();
+        if let Some(import) = items.iter().rev().find_map(|item| match item {
+            ast::Item::Use(import) => Some(import),
+            _ => None,
+        }) {
+            let range = text_range(import.syntax());
+            let insertion =
+                range.end + usize::from(source.as_bytes().get(range.end) == Some(&b'\n'));
+            return (insertion, line_indent(source, range.start));
+        }
+        if let Some(item) = items.first() {
+            let start = text_range(item.syntax()).start;
+            let indent = line_indent(source, start);
+            return (start.saturating_sub(indent.len()), indent);
+        }
+        if let Some(brace) = list.l_curly_token() {
+            let insertion = usize::from(brace.text_range().end());
+            let parent_indent = line_indent(source, insertion.saturating_sub(1));
+            return (insertion, format!("\n{parent_indent}    "));
+        }
+    }
+    (import_insertion(file, source), String::new())
+}
+
+fn line_indent(source: &str, offset: usize) -> String {
+    let line_start = source[..offset].rfind('\n').map_or(0, |index| index + 1);
+    source[line_start..offset]
+        .chars()
+        .take_while(|character| matches!(character, ' ' | '\t'))
+        .collect()
+}
+
+fn import_insertion(file: &ast::SourceFile, source: &str) -> usize {
+    let last_import = file
+        .items()
+        .filter_map(|item| match item {
+            ast::Item::Use(import) => Some(text_range(import.syntax()).end),
+            _ => None,
+        })
+        .last();
+    last_import.map_or_else(
+        || {
+            file.items()
+                .next()
+                .map(|item| text_range(item.syntax()).start)
+                .unwrap_or(0)
+        },
+        |end| end + usize::from(source.as_bytes().get(end) == Some(&b'\n')),
+    )
+}
+
+fn text_range(node: &SyntaxNode) -> std::ops::Range<usize> {
+    let range = node.text_range();
+    usize::from(range.start())..usize::from(range.end())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use tempfile::tempdir;
+
+    use crate::config::Config;
+    use crate::qualification::check;
+    use tempfile::TempDir;
+
+    fn config() -> (TempDir, Config) {
+        let directory = tempdir().expect("temporary directory");
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[workspace]\nmembers=[]\n",
+        )
+        .expect("manifest");
+        let config = Config::load(directory.path(), None).expect("configuration");
+        (directory, config)
+    }
+
+    #[test]
+    fn shortens_type_variant_and_function_paths_with_shared_imports() {
+        let (_directory, config) = config();
+        let source =
+            "fn f(value: cards::Card) { workflow::runner::run(); let _ = ui::Value::Ready; }\n";
+        let findings = check(&config, Path::new("src/lib.rs"), source);
+        assert_eq!(findings.len(), 3);
+        let mut fixed = source.to_owned();
+        let mut edits = findings[0].edits.clone();
+        edits.sort_by_key(|edit| edit.range.start);
+        for edit in edits.into_iter().rev() {
+            fixed.replace_range(edit.range, &edit.replacement);
+        }
+        assert!(fixed.contains("use cards::Card;"));
+        assert!(fixed.contains("use ui::Value;"));
+        assert!(fixed.contains("use workflow::runner;"));
+        assert!(fixed.contains("fn f(value: Card)"));
+        assert!(fixed.contains("runner::run()"));
+        assert!(fixed.contains("Value::Ready"));
+    }
+
+    #[test]
+    fn rewrites_relative_imports_from_the_file_module() {
+        let (_directory, config) = config();
+        let source = "use super::card::Card;\n";
+        let findings = check(&config, Path::new("src/game/deck.rs"), source);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].edits[0].replacement, "crate::game::card::Card;");
+    }
+}

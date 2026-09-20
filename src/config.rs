@@ -366,7 +366,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::Config;
+    use crate::config::Config;
 
     #[test]
     fn applies_last_matching_rule_override() {

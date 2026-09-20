@@ -4,6 +4,7 @@ pub(crate) mod config;
 pub(crate) mod diagnostic;
 pub(crate) mod discovery;
 pub(crate) mod engine;
+pub(crate) mod qualification;
 pub(crate) mod rules;
 pub(crate) mod transaction;
 

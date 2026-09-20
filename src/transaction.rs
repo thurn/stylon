@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::diagnostic::OperationalError;
+use std::fs::Permissions;
 
 const LOCK_FILE: &str = ".stylon.lock";
 const TRANSACTION_DIRECTORY: &str = ".stylon-transaction";
@@ -17,7 +18,7 @@ pub(crate) struct Change {
     pub(crate) path: PathBuf,
     pub(crate) original: Vec<u8>,
     pub(crate) replacement: Vec<u8>,
-    pub(crate) permissions: fs::Permissions,
+    pub(crate) permissions: Permissions,
 }
 
 pub(crate) fn recover_if_needed(config: &Config, fix: bool) -> Result<(), OperationalError> {
@@ -232,7 +233,7 @@ fn atomic_replace(change: &Change) -> Result<(), OperationalError> {
 fn replace_bytes(
     path: &Path,
     replacement: &[u8],
-    permissions: fs::Permissions,
+    permissions: Permissions,
 ) -> Result<(), OperationalError> {
     let parent = path.parent().expect("changed file has a parent");
     let name = path
@@ -254,7 +255,7 @@ fn replace_bytes(
 fn durable_write(
     path: &Path,
     bytes: &[u8],
-    permissions: Option<fs::Permissions>,
+    permissions: Option<Permissions>,
 ) -> Result<(), OperationalError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -364,7 +365,7 @@ fn sync_directory(path: &Path) -> Result<(), OperationalError> {
 #[cfg(unix)]
 fn set_private_permissions(path: &Path) -> Result<(), OperationalError> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
+    fs::set_permissions(path, Permissions::from_mode(0o700)).map_err(|source| {
         error(
             "filesystem",
             format!("cannot protect {}: {source}", path.display()),
@@ -429,7 +430,7 @@ fn error(
 
 #[cfg(test)]
 mod tests {
-    use super::truncated;
+    use crate::transaction::truncated;
 
     #[test]
     fn truncates_large_validation_output() {

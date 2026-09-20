@@ -9,6 +9,11 @@ use toml_edit::{DocumentMut, Item, Table};
 
 use crate::config::Config;
 use crate::diagnostic::Diagnostic;
+use pulldown_cmark::CowStr;
+use ra_ap_syntax::SyntaxNode;
+use ra_ap_syntax::TextSize;
+use ra_ap_syntax::ast::Comment;
+use ra_ap_syntax::ast::Module;
 
 static RULES: [&dyn Rule; 3] = [&RustdocTypeLinks, &ItemOrder, &BlankLines];
 
@@ -39,6 +44,7 @@ pub(crate) fn check(config: &Config, relative: &Path, source: &str) -> Vec<Findi
             rule.check(&context, &mut findings);
         }
     }
+    findings.extend(crate::qualification::check(config, relative, source));
     findings
 }
 
@@ -328,7 +334,7 @@ fn visibility(item: &ast::Item) -> Visibility {
     }
 }
 
-fn is_test_module(module: &ast::Module) -> bool {
+fn is_test_module(module: &Module) -> bool {
     let Some(name) = module.name() else {
         return false;
     };
@@ -343,7 +349,7 @@ fn is_test_module(module: &ast::Module) -> bool {
         || text.contains("#[cfg(all(") && text.contains(",test")
 }
 
-fn text_range(node: &ra_ap_syntax::SyntaxNode) -> Range<usize> {
+fn text_range(node: &SyntaxNode) -> Range<usize> {
     let range = node.text_range();
     usize::from(range.start())..usize::from(range.end())
 }
@@ -359,7 +365,7 @@ fn has_empty_line(separator: &str) -> bool {
 
 fn check_doc_comment(
     context: &RuleContext<'_>,
-    comment: &ast::Comment,
+    comment: &Comment,
     known: &HashSet<String>,
     findings: &mut Vec<Finding>,
 ) {
@@ -369,7 +375,7 @@ fn check_doc_comment(
     let callback = |link: BrokenLink<'_>| {
         Some((
             pulldown_cmark::CowStr::from(link.reference.to_string()),
-            pulldown_cmark::CowStr::Borrowed(""),
+            CowStr::Borrowed(""),
         ))
     };
     let parser = Parser::new_with_broken_link_callback(content, Options::empty(), Some(callback))
@@ -404,8 +410,8 @@ fn check_doc_comment(
 #[allow(clippy::too_many_arguments)]
 fn check_doc_link(
     context: &RuleContext<'_>,
-    comment: &ast::Comment,
-    prefix_offset: ra_ap_syntax::TextSize,
+    comment: &Comment,
+    prefix_offset: TextSize,
     content: &str,
     destination: &str,
     markdown_range: Range<usize>,
@@ -576,10 +582,11 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{check, check_manifest};
     use crate::config::Config;
+    use crate::rules::{check, check_manifest};
+    use tempfile::TempDir;
 
-    fn config() -> (tempfile::TempDir, Config) {
+    fn config() -> (TempDir, Config) {
         let directory = tempdir().expect("temporary directory");
         fs::write(
             directory.path().join("Cargo.toml"),

@@ -14,7 +14,9 @@ use crate::config::Config;
 use crate::diagnostic::{Diagnostic, JsonOutput, OperationalError, Summary, Timings};
 use crate::discovery;
 use crate::rules;
+use crate::rules::Edit;
 use crate::transaction::{self, Change};
+use toml::Value;
 
 pub(crate) fn run(cli: &Cli) -> ExitCode {
     let started = Instant::now();
@@ -206,6 +208,8 @@ fn fixed_source(
             });
         }
         let before = source.clone();
+        source = apply_qualification_edits(config, relative, source)?;
+        ensure_parseable(relative, &source)?;
         source = apply_rule_edits(config, relative, source, "rustdoc.type-links")?;
         ensure_parseable(relative, &source)?;
         source = apply_rule_edits(config, relative, source, "items.order")?;
@@ -230,6 +234,32 @@ fn fixed_source(
     })
 }
 
+fn apply_qualification_edits(
+    config: &Config,
+    relative: &std::path::Path,
+    mut source: String,
+) -> Result<String, OperationalError> {
+    let mut edits: Vec<_> = rules::check(config, relative, &source)
+        .into_iter()
+        .filter(|finding| {
+            matches!(
+                finding.diagnostic.rule_id,
+                "imports.absolute-crate-path"
+                    | "path.enum-variant-qualification"
+                    | "path.function-qualification"
+                    | "path.type-qualification"
+            )
+        })
+        .flat_map(|finding| finding.edits)
+        .collect();
+    edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
+    ensure_non_overlapping(relative, &edits)?;
+    for edit in edits.into_iter().rev() {
+        source.replace_range(edit.range, &edit.replacement);
+    }
+    Ok(source)
+}
+
 fn apply_rule_edits(
     config: &Config,
     relative: &std::path::Path,
@@ -251,7 +281,7 @@ fn apply_rule_edits(
 
 fn ensure_non_overlapping(
     relative: &std::path::Path,
-    edits: &[rules::Edit],
+    edits: &[Edit],
 ) -> Result<(), OperationalError> {
     if edits
         .windows(2)
@@ -352,7 +382,7 @@ fn parse_file(config: &Config, path: &PathBuf) -> Result<ParsedFile, Operational
             syntax_nodes: parsed.syntax_node().descendants().count(),
         })
     } else {
-        toml::from_str::<toml::Value>(&source).map_err(|source| OperationalError {
+        toml::from_str::<Value>(&source).map_err(|source| OperationalError {
             category: "parse",
             message: format!("{}: {source}", relative.display()),
             paths: vec![relative],

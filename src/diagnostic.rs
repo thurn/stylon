@@ -103,7 +103,7 @@ fn position(source: &str, offset: usize) -> Position {
 
 #[cfg(test)]
 mod tests {
-    use super::{Diagnostic, Position};
+    use crate::diagnostic::{Diagnostic, Position};
 
     #[test]
     fn positions_count_unicode_scalars_and_crlf_as_one_line() {

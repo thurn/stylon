@@ -369,7 +369,7 @@ mod tests {
     use tempfile::tempdir;
     use toml_edit::Item;
 
-    use super::{ManifestInput, Policy, build_workspace_plan, inherited_item};
+    use crate::cargo_rules::{ManifestInput, Policy, build_workspace_plan, inherited_item};
     use crate::config::Config;
 
     #[test]
