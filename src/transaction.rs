@@ -18,9 +18,9 @@ const TRANSACTION_DIRECTORY: &str = ".stylon-transaction";
 #[derive(Clone, Debug)]
 pub(crate) struct Change {
     pub(crate) path: PathBuf,
-    pub(crate) original: Vec<u8>,
+    pub(crate) original: Option<Vec<u8>>,
     pub(crate) replacement: Vec<u8>,
-    pub(crate) permissions: Permissions,
+    pub(crate) permissions: Option<Permissions>,
 }
 
 pub(crate) fn recover_if_needed(config: &Config, fix: bool) -> Result<(), OperationalError> {
@@ -64,8 +64,10 @@ pub(crate) fn apply(
     }
     let _lock = ProjectLock::acquire(&config.root)?;
     verify_inventory(inventory)?;
+    verify_changes(changes)?;
     validate(config, "baseline-validation")?;
     verify_inventory(inventory)?;
+    verify_changes(changes)?;
 
     let transaction = config.root.join(TRANSACTION_DIRECTORY);
     prepare_journal(&config.root, &transaction, changes)?;
@@ -107,7 +109,7 @@ struct Journal {
 #[derive(Debug, Deserialize, Serialize)]
 struct JournalEntry {
     relative: PathBuf,
-    original: String,
+    original: Option<String>,
     replacement: String,
 }
 
@@ -127,9 +129,14 @@ fn prepare_journal(
 
     let mut entries = Vec::with_capacity(changes.len());
     for (index, change) in changes.iter().enumerate() {
-        let original = format!("{index}.original");
+        let original = change
+            .original
+            .as_ref()
+            .map(|_| format!("{index}.original"));
         let replacement = format!("{index}.replacement");
-        durable_write(&transaction.join(&original), &change.original, None)?;
+        if let (Some(name), Some(bytes)) = (&original, &change.original) {
+            durable_write(&transaction.join(name), bytes, None)?;
+        }
         durable_write(&transaction.join(&replacement), &change.replacement, None)?;
         entries.push(JournalEntry {
             relative: change
@@ -172,16 +179,21 @@ fn restore_transaction(root: &Path, transaction: &Path) -> Result<(), Operationa
 
     for entry in journal.entries {
         let path = root.join(&entry.relative);
-        let original = fs::read(transaction.join(entry.original)).map_err(|source| {
-            error(
-                "recovery",
-                format!(
-                    "cannot read backup for {}: {source}",
-                    entry.relative.display()
-                ),
-                vec![entry.relative.clone()],
-            )
-        })?;
+        let original = entry
+            .original
+            .map(|name| {
+                fs::read(transaction.join(name)).map_err(|source| {
+                    error(
+                        "recovery",
+                        format!(
+                            "cannot read backup for {}: {source}",
+                            entry.relative.display()
+                        ),
+                        vec![entry.relative.clone()],
+                    )
+                })
+            })
+            .transpose()?;
         let replacement = fs::read(transaction.join(entry.replacement)).map_err(|source| {
             error(
                 "recovery",
@@ -192,14 +204,8 @@ fn restore_transaction(root: &Path, transaction: &Path) -> Result<(), Operationa
                 vec![entry.relative.clone()],
             )
         })?;
-        let current = fs::read(&path).map_err(|source| {
-            error(
-                "recovery",
-                format!("cannot inspect {}: {source}", entry.relative.display()),
-                vec![entry.relative.clone()],
-            )
-        })?;
-        if current != original && current != replacement {
+        let current = fs::read(&path).ok();
+        if current.as_ref() != original.as_ref() && current.as_ref() != Some(&replacement) {
             return Err(error(
                 "recovery",
                 format!(
@@ -210,7 +216,9 @@ fn restore_transaction(root: &Path, transaction: &Path) -> Result<(), Operationa
                 vec![entry.relative],
             ));
         }
-        if current != original {
+        if current.as_ref() != original.as_ref()
+            && let Some(original) = original.as_ref()
+        {
             let permissions = fs::metadata(&path).map_err(|source| {
                 error(
                     "recovery",
@@ -218,7 +226,19 @@ fn restore_transaction(root: &Path, transaction: &Path) -> Result<(), Operationa
                     vec![entry.relative.clone()],
                 )
             })?;
-            replace_bytes(&path, &original, permissions.permissions())?;
+            replace_bytes(&path, original, Some(permissions.permissions()))?;
+        } else if original.is_none() && current.is_some() {
+            fs::remove_file(&path).map_err(|source| {
+                error(
+                    "recovery",
+                    format!(
+                        "cannot remove created file {}: {source}",
+                        entry.relative.display()
+                    ),
+                    vec![entry.relative.clone()],
+                )
+            })?;
+            sync_directory(path.parent().expect("created file has a parent"))?;
         }
     }
     Ok(())
@@ -235,7 +255,7 @@ fn atomic_replace(change: &Change) -> Result<(), OperationalError> {
 fn replace_bytes(
     path: &Path,
     replacement: &[u8],
-    permissions: Permissions,
+    permissions: Option<Permissions>,
 ) -> Result<(), OperationalError> {
     let parent = path.parent().expect("changed file has a parent");
     let name = path
@@ -243,7 +263,7 @@ fn replace_bytes(
         .expect("changed file has a name")
         .to_string_lossy();
     let temporary = parent.join(format!(".{name}.stylon-{}", std::process::id()));
-    durable_write(&temporary, replacement, Some(permissions))?;
+    durable_write(&temporary, replacement, permissions)?;
     fs::rename(&temporary, path).map_err(|source| {
         error(
             "filesystem",
@@ -301,6 +321,25 @@ fn verify_inventory(inventory: &[(PathBuf, Vec<u8>)]) -> Result<(), OperationalE
         Err(error(
             "concurrent-modification",
             "project inputs changed during fix planning or validation",
+            changed,
+        ))
+    }
+}
+
+fn verify_changes(changes: &[Change]) -> Result<(), OperationalError> {
+    let mut changed = Vec::new();
+    for change in changes {
+        let current = fs::read(&change.path).ok();
+        if current.as_ref() != change.original.as_ref() {
+            changed.push(change.path.clone());
+        }
+    }
+    if changed.is_empty() {
+        Ok(())
+    } else {
+        Err(error(
+            "concurrent-modification",
+            "a fix target changed or a create destination appeared",
             changed,
         ))
     }
@@ -429,13 +468,6 @@ fn error(
     }
 }
 
+#[path = "transaction_tests.rs"]
 #[cfg(test)]
-mod tests {
-    use crate::transaction::truncated;
-
-    #[test]
-    fn truncates_large_validation_output() {
-        let output = truncated(&vec![b'a'; 1024 * 1024 + 1]);
-        assert!(output.ends_with("[output truncated at 1 MiB]"));
-    }
-}
+mod tests;

@@ -7,6 +7,7 @@ pub(crate) mod engine;
 pub(crate) mod imports;
 pub(crate) mod qualification;
 pub(crate) mod rules;
+pub(crate) mod tests_layout;
 pub(crate) mod transaction;
 
 use std::ffi::OsString;

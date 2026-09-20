@@ -101,16 +101,44 @@ pub(crate) fn run(cli: &Cli) -> ExitCode {
             source: &file.source,
         })
         .collect();
-    let public_functions = crate::imports::analyze_public_functions(&config, &rust_inputs);
+    let test_layout = crate::tests_layout::analyze_inline_tests(&config, &rust_inputs);
+    diagnostics.extend(test_layout.diagnostics);
+    errors.extend(test_layout.errors);
+    let virtual_sources: Vec<_> = rust_inputs
+        .iter()
+        .map(|input| {
+            test_layout
+                .replacements
+                .get(input.path)
+                .cloned()
+                .unwrap_or_else(|| input.source.to_owned())
+        })
+        .collect();
+    let virtual_inputs: Vec<_> = rust_inputs
+        .iter()
+        .zip(&virtual_sources)
+        .map(|(input, source)| RustInput {
+            path: input.path,
+            relative: input.relative.clone(),
+            source,
+        })
+        .collect();
+    let public_functions = crate::imports::analyze_public_functions(&config, &virtual_inputs);
     diagnostics.extend(public_functions.diagnostics);
     let mut project_replacements = workspace.replacements;
+    project_replacements.extend(test_layout.replacements);
     project_replacements.extend(public_functions.replacements);
     if let Some(timings) = &mut summary.timings {
         timings.rule_evaluation_ms = milliseconds(evaluation_started.elapsed());
     }
 
     if cli.fix && errors.is_empty() && !diagnostics.is_empty() {
-        match plan_changes(&config, &parsed, &project_replacements) {
+        match plan_changes(
+            &config,
+            &parsed,
+            &project_replacements,
+            &test_layout.creations,
+        ) {
             Ok(changes) => {
                 let inventory = inventory(&config, &parsed);
                 match transaction::apply(&config, &changes, &inventory) {
@@ -141,8 +169,9 @@ fn plan_changes(
     config: &Config,
     parsed: &[ParsedFile],
     workspace_replacements: &std::collections::BTreeMap<PathBuf, String>,
+    creations: &std::collections::BTreeMap<PathBuf, String>,
 ) -> Result<Vec<Change>, OperationalError> {
-    parsed
+    let mut changes: Vec<_> = parsed
         .iter()
         .filter_map(|file| {
             let relative = config.relative(&file.path);
@@ -168,16 +197,27 @@ fn plan_changes(
                     };
                     Some(Ok(Change {
                         path: file.path.clone(),
-                        original: file.source.as_bytes().to_vec(),
+                        original: Some(file.source.as_bytes().to_vec()),
                         replacement: replacement.into_bytes(),
-                        permissions,
+                        permissions: Some(permissions),
                     }))
                 }
                 Ok(_) => None,
                 Err(error) => Some(Err(error)),
             }
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    for (path, source) in creations {
+        let relative = config.relative(path);
+        let replacement = fixed_source(config, &relative, source)?;
+        changes.push(Change {
+            path: path.clone(),
+            original: None,
+            replacement: replacement.into_bytes(),
+            permissions: None,
+        });
+    }
+    Ok(changes)
 }
 
 fn fixed_manifest(
@@ -497,64 +537,6 @@ fn milliseconds(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+#[path = "engine_tests.rs"]
 #[cfg(test)]
-mod tests {
-    use std::ffi::OsString;
-    use std::fs;
-
-    use tempfile::tempdir;
-
-    #[test]
-    fn clean_project_exits_successfully() {
-        let directory = tempdir().expect("temporary directory");
-        std::fs::write(
-            directory.path().join("Cargo.toml"),
-            "[package]\nname='x'\nversion='0.1.0'\n",
-        )
-        .expect("manifest");
-        std::fs::write(directory.path().join("lib.rs"), "pub struct Example;\n").expect("source");
-        let arguments = [
-            OsString::from("stylon"),
-            directory.path().as_os_str().to_owned(),
-        ];
-        assert_eq!(
-            super::super::run(arguments),
-            std::process::ExitCode::SUCCESS
-        );
-    }
-
-    #[test]
-    fn fix_is_clean_and_idempotent() {
-        let directory = tempdir().expect("temporary directory");
-        fs::create_dir(directory.path().join("src")).expect("source directory");
-        fs::write(
-            directory.path().join("Cargo.toml"),
-            "[package]\nname='fixture'\nversion='0.1.0'\nedition='2024'\n",
-        )
-        .expect("manifest");
-        fs::write(
-            directory.path().join("Cargo.lock"),
-            "version = 4\n\n[[package]]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
-        )
-        .expect("lockfile");
-        let source_path = directory.path().join("src/lib.rs");
-        fs::write(&source_path, "fn helper() {}\npub struct Public;\n").expect("source");
-        let arguments = [
-            OsString::from("stylon"),
-            OsString::from("--fix"),
-            directory.path().as_os_str().to_owned(),
-        ];
-
-        assert_eq!(
-            super::super::run(arguments.clone()),
-            std::process::ExitCode::SUCCESS
-        );
-        let fixed = fs::read(&source_path).expect("fixed source");
-        assert_eq!(fixed, b"pub struct Public;\n\nfn helper() {}\n");
-        assert_eq!(
-            super::super::run(arguments),
-            std::process::ExitCode::SUCCESS
-        );
-        assert_eq!(fs::read(source_path).expect("second source"), fixed);
-    }
-}
+mod tests;
