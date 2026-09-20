@@ -19,7 +19,7 @@ const TRANSACTION_DIRECTORY: &str = ".stylon-transaction";
 pub(crate) struct Change {
     pub(crate) path: PathBuf,
     pub(crate) original: Option<Vec<u8>>,
-    pub(crate) replacement: Vec<u8>,
+    pub(crate) replacement: Option<Vec<u8>>,
     pub(crate) permissions: Option<Permissions>,
 }
 
@@ -110,7 +110,9 @@ struct Journal {
 struct JournalEntry {
     relative: PathBuf,
     original: Option<String>,
-    replacement: String,
+    replacement: Option<String>,
+    #[serde(default)]
+    mode: Option<u32>,
 }
 
 fn prepare_journal(
@@ -133,11 +135,16 @@ fn prepare_journal(
             .original
             .as_ref()
             .map(|_| format!("{index}.original"));
-        let replacement = format!("{index}.replacement");
+        let replacement = change
+            .replacement
+            .as_ref()
+            .map(|_| format!("{index}.replacement"));
         if let (Some(name), Some(bytes)) = (&original, &change.original) {
             durable_write(&transaction.join(name), bytes, None)?;
         }
-        durable_write(&transaction.join(&replacement), &change.replacement, None)?;
+        if let (Some(name), Some(bytes)) = (&replacement, &change.replacement) {
+            durable_write(&transaction.join(name), bytes, None)?;
+        }
         entries.push(JournalEntry {
             relative: change
                 .path
@@ -146,6 +153,7 @@ fn prepare_journal(
                 .to_path_buf(),
             original,
             replacement,
+            mode: change.permissions.as_ref().and_then(permission_mode),
         });
     }
     let journal = serde_json::to_vec(&Journal { entries }).map_err(|source| {
@@ -194,18 +202,23 @@ fn restore_transaction(root: &Path, transaction: &Path) -> Result<(), Operationa
                 })
             })
             .transpose()?;
-        let replacement = fs::read(transaction.join(entry.replacement)).map_err(|source| {
-            error(
-                "recovery",
-                format!(
-                    "cannot read replacement for {}: {source}",
-                    entry.relative.display()
-                ),
-                vec![entry.relative.clone()],
-            )
-        })?;
+        let replacement = entry
+            .replacement
+            .map(|name| {
+                fs::read(transaction.join(name)).map_err(|source| {
+                    error(
+                        "recovery",
+                        format!(
+                            "cannot read replacement for {}: {source}",
+                            entry.relative.display()
+                        ),
+                        vec![entry.relative.clone()],
+                    )
+                })
+            })
+            .transpose()?;
         let current = fs::read(&path).ok();
-        if current.as_ref() != original.as_ref() && current.as_ref() != Some(&replacement) {
+        if current.as_ref() != original.as_ref() && current.as_ref() != replacement.as_ref() {
             return Err(error(
                 "recovery",
                 format!(
@@ -219,14 +232,12 @@ fn restore_transaction(root: &Path, transaction: &Path) -> Result<(), Operationa
         if current.as_ref() != original.as_ref()
             && let Some(original) = original.as_ref()
         {
-            let permissions = fs::metadata(&path).map_err(|source| {
-                error(
-                    "recovery",
-                    format!("cannot inspect {}: {source}", entry.relative.display()),
-                    vec![entry.relative.clone()],
-                )
-            })?;
-            replace_bytes(&path, original, Some(permissions.permissions()))?;
+            let permissions = entry.mode.and_then(permissions_from_mode).or_else(|| {
+                fs::metadata(&path)
+                    .ok()
+                    .map(|metadata| metadata.permissions())
+            });
+            replace_bytes(&path, original, permissions)?;
         } else if original.is_none() && current.is_some() {
             fs::remove_file(&path).map_err(|source| {
                 error(
@@ -245,11 +256,18 @@ fn restore_transaction(root: &Path, transaction: &Path) -> Result<(), Operationa
 }
 
 fn atomic_replace(change: &Change) -> Result<(), OperationalError> {
-    replace_bytes(
-        &change.path,
-        &change.replacement,
-        change.permissions.clone(),
-    )
+    if let Some(replacement) = &change.replacement {
+        replace_bytes(&change.path, replacement, change.permissions.clone())
+    } else {
+        fs::remove_file(&change.path).map_err(|source| {
+            error(
+                "filesystem",
+                format!("cannot remove {}: {source}", change.path.display()),
+                vec![change.path.clone()],
+            )
+        })?;
+        sync_directory(change.path.parent().expect("deleted file has a parent"))
+    }
 }
 
 fn replace_bytes(
@@ -417,6 +435,26 @@ fn set_private_permissions(path: &Path) -> Result<(), OperationalError> {
 #[cfg(not(unix))]
 fn set_private_permissions(_path: &Path) -> Result<(), OperationalError> {
     Ok(())
+}
+
+#[cfg(unix)]
+fn permission_mode(permissions: &Permissions) -> Option<u32> {
+    Some(permissions.mode())
+}
+
+#[cfg(not(unix))]
+fn permission_mode(_permissions: &Permissions) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn permissions_from_mode(mode: u32) -> Option<Permissions> {
+    Some(Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn permissions_from_mode(_mode: u32) -> Option<Permissions> {
+    None
 }
 
 struct ProjectLock {

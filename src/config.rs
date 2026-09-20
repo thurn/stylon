@@ -33,7 +33,6 @@ pub(crate) struct Config {
     pub(crate) validation_command: Vec<String>,
     pub(crate) validation_is_default: bool,
     pub(crate) constant_macros: HashSet<String>,
-    #[expect(dead_code, reason = "consumed by the staged test-layout rules")]
     pub(crate) test_attributes: HashSet<String>,
 }
 

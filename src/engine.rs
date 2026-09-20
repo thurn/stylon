@@ -101,33 +101,79 @@ pub(crate) fn run(cli: &Cli) -> ExitCode {
             source: &file.source,
         })
         .collect();
-    let test_layout = crate::tests_layout::analyze_inline_tests(&config, &rust_inputs);
-    diagnostics.extend(test_layout.diagnostics);
-    errors.extend(test_layout.errors);
-    let virtual_sources: Vec<_> = rust_inputs
+    let inline_tests = crate::tests_layout::analyze_inline_tests(&config, &rust_inputs);
+    diagnostics.extend(inline_tests.diagnostics.clone());
+    errors.extend(inline_tests.errors.clone());
+    let inline_sources: Vec<_> = rust_inputs
         .iter()
         .map(|input| {
-            test_layout
+            inline_tests
                 .replacements
                 .get(input.path)
                 .cloned()
                 .unwrap_or_else(|| input.source.to_owned())
         })
         .collect();
-    let virtual_inputs: Vec<_> = rust_inputs
+    let mut inline_inputs: Vec<_> = rust_inputs
         .iter()
-        .zip(&virtual_sources)
+        .zip(&inline_sources)
         .map(|(input, source)| RustInput {
             path: input.path,
             relative: input.relative.clone(),
             source,
         })
         .collect();
-    let public_functions = crate::imports::analyze_public_functions(&config, &virtual_inputs);
+    inline_inputs.extend(
+        inline_tests
+            .creations
+            .iter()
+            .map(|(path, source)| RustInput {
+                path,
+                relative: config.relative(path),
+                source,
+            }),
+    );
+    let mut virtual_manifests: std::collections::BTreeMap<_, _> = manifest_inputs
+        .iter()
+        .map(|input| (input.path.to_path_buf(), input.source.to_owned()))
+        .collect();
+    virtual_manifests.extend(workspace.replacements.clone());
+    let file_suffix =
+        crate::tests_layout::analyze_file_suffix(&config, &inline_inputs, &virtual_manifests);
+    diagnostics.extend(file_suffix.diagnostics.clone());
+    errors.extend(file_suffix.errors.clone());
+
+    let mut structural_sources: std::collections::BTreeMap<_, _> = inline_inputs
+        .iter()
+        .map(|input| (input.path.to_path_buf(), input.source.to_owned()))
+        .collect();
+    structural_sources.extend(file_suffix.replacements.clone());
+    for path in &file_suffix.deletions {
+        structural_sources.remove(path);
+    }
+    structural_sources.extend(file_suffix.creations.clone());
+    let structural_inputs: Vec<_> = structural_sources
+        .iter()
+        .map(|(path, source)| RustInput {
+            path,
+            relative: config.relative(path),
+            source,
+        })
+        .collect();
+    let public_functions = crate::imports::analyze_public_functions(&config, &structural_inputs);
     diagnostics.extend(public_functions.diagnostics);
     let mut project_replacements = workspace.replacements;
-    project_replacements.extend(test_layout.replacements);
-    project_replacements.extend(public_functions.replacements);
+    project_replacements.extend(inline_tests.replacements);
+    project_replacements.extend(file_suffix.replacements);
+    let mut creations = inline_tests.creations;
+    creations.extend(file_suffix.creations);
+    for (path, replacement) in public_functions.replacements {
+        if let Some(created) = creations.get_mut(&path) {
+            *created = replacement;
+        } else {
+            project_replacements.insert(path, replacement);
+        }
+    }
     if let Some(timings) = &mut summary.timings {
         timings.rule_evaluation_ms = milliseconds(evaluation_started.elapsed());
     }
@@ -137,7 +183,8 @@ pub(crate) fn run(cli: &Cli) -> ExitCode {
             &config,
             &parsed,
             &project_replacements,
-            &test_layout.creations,
+            &creations,
+            &file_suffix.deletions,
         ) {
             Ok(changes) => {
                 let inventory = inventory(&config, &parsed);
@@ -170,9 +217,11 @@ fn plan_changes(
     parsed: &[ParsedFile],
     workspace_replacements: &std::collections::BTreeMap<PathBuf, String>,
     creations: &std::collections::BTreeMap<PathBuf, String>,
+    deletions: &std::collections::BTreeSet<PathBuf>,
 ) -> Result<Vec<Change>, OperationalError> {
     let mut changes: Vec<_> = parsed
         .iter()
+        .filter(|file| !deletions.contains(&file.path))
         .filter_map(|file| {
             let relative = config.relative(&file.path);
             let initial = workspace_replacements
@@ -198,7 +247,7 @@ fn plan_changes(
                     Some(Ok(Change {
                         path: file.path.clone(),
                         original: Some(file.source.as_bytes().to_vec()),
-                        replacement: replacement.into_bytes(),
+                        replacement: Some(replacement.into_bytes()),
                         permissions: Some(permissions),
                     }))
                 }
@@ -207,13 +256,33 @@ fn plan_changes(
             }
         })
         .collect::<Result<_, _>>()?;
+    for path in deletions {
+        let file = parsed
+            .iter()
+            .find(|file| &file.path == path)
+            .expect("deleted file came from the parsed snapshot");
+        let permissions = fs::metadata(path).map_err(|source| OperationalError {
+            category: "filesystem",
+            message: format!(
+                "cannot inspect {}: {source}",
+                config.relative(path).display()
+            ),
+            paths: vec![config.relative(path)],
+        })?;
+        changes.push(Change {
+            path: path.clone(),
+            original: Some(file.source.as_bytes().to_vec()),
+            replacement: None,
+            permissions: Some(permissions.permissions()),
+        });
+    }
     for (path, source) in creations {
         let relative = config.relative(path);
         let replacement = fixed_source(config, &relative, source)?;
         changes.push(Change {
             path: path.clone(),
             original: None,
-            replacement: replacement.into_bytes(),
+            replacement: Some(replacement.into_bytes()),
             permissions: None,
         });
     }

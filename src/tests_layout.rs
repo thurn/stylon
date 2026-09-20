@@ -1,13 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use ra_ap_syntax::ast::{self, AstNode, HasModuleItem, HasName};
+use ra_ap_syntax::ast::{self, AstNode, HasAttrs, HasModuleItem, HasName};
 use ra_ap_syntax::{Edition, SourceFile};
 
 use crate::config::Config;
 use crate::diagnostic::{Diagnostic, OperationalError};
 use crate::imports::RustInput;
 use ra_ap_syntax::SyntaxNode;
+use ra_ap_syntax::ast::Fn;
+use toml_edit::{DocumentMut, Item};
 
 #[derive(Debug, Default)]
 pub(crate) struct TestLayoutAnalysis {
@@ -15,6 +17,132 @@ pub(crate) struct TestLayoutAnalysis {
     pub(crate) errors: Vec<OperationalError>,
     pub(crate) replacements: BTreeMap<PathBuf, String>,
     pub(crate) creations: BTreeMap<PathBuf, String>,
+    pub(crate) deletions: BTreeSet<PathBuf>,
+}
+
+pub(crate) fn analyze_file_suffix(
+    config: &Config,
+    inputs: &[RustInput<'_>],
+    manifests: &BTreeMap<PathBuf, String>,
+) -> TestLayoutAnalysis {
+    let mut analysis = TestLayoutAnalysis::default();
+    let existing: BTreeSet<_> = inputs
+        .iter()
+        .map(|input| input.path.to_path_buf())
+        .collect();
+    for input in inputs {
+        if !config.rule_enabled("tests.file-suffix", &input.relative)
+            || input
+                .path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with("_tests.rs"))
+        {
+            continue;
+        }
+        let parsed = SourceFile::parse(input.source, Edition::Edition2024);
+        let functions: Vec<_> = parsed
+            .tree()
+            .items()
+            .filter_map(|item| match item {
+                ast::Item::Fn(function) if is_test_function(config, &function) => Some(function),
+                _ => None,
+            })
+            .collect();
+        if functions.is_empty() {
+            continue;
+        }
+        let destination = input.path.with_file_name(format!(
+            "{}_tests.rs",
+            input
+                .path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("module")
+        ));
+        let range = text_range(functions[0].syntax());
+        if is_special_entry(&input.relative) {
+            extract_special_tests(config, input, &functions, destination, range, &mut analysis);
+            continue;
+        }
+        if destination_conflicts(&destination, &existing, &analysis.creations) {
+            analysis.errors.push(OperationalError {
+                category: "planning",
+                message: format!(
+                    "test file destination already exists: {}",
+                    destination.display()
+                ),
+                paths: vec![config.relative(&destination)],
+            });
+            continue;
+        }
+        if is_integration_test(&input.relative) {
+            let manifest = config.root.join("Cargo.toml");
+            let Some(manifest_source) = manifests.get(&manifest) else {
+                analysis.errors.push(OperationalError {
+                    category: "test-layout",
+                    message: "an integration test move requires a readable root Cargo.toml"
+                        .to_owned(),
+                    paths: vec![PathBuf::from("Cargo.toml"), input.relative.clone()],
+                });
+                continue;
+            };
+            let target_name = input
+                .path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("UTF-8 paths were checked");
+            let destination_relative = config.relative(&destination);
+            let current_manifest = analysis
+                .replacements
+                .get(&manifest)
+                .unwrap_or(manifest_source);
+            let Ok(replacement) = preserve_test_target(
+                current_manifest,
+                target_name,
+                &input.relative,
+                &destination_relative,
+            ) else {
+                analysis.errors.push(OperationalError {
+                    category: "planning",
+                    message: format!(
+                        "Cargo test target `{target_name}` already points to a different path"
+                    ),
+                    paths: vec![PathBuf::from("Cargo.toml"), input.relative.clone()],
+                });
+                continue;
+            };
+            analysis.replacements.insert(manifest, replacement);
+        } else if !rewrite_parent_declaration(
+            config,
+            inputs,
+            input.path,
+            &destination,
+            &mut analysis,
+        ) {
+            analysis.errors.push(OperationalError {
+                category: "test-layout",
+                message: format!(
+                    "cannot find the external module declaration for {}",
+                    input.relative.display()
+                ),
+                paths: vec![input.relative.clone()],
+            });
+            continue;
+        }
+        analysis
+            .creations
+            .insert(destination, input.source.to_owned());
+        analysis.deletions.insert(input.path.to_path_buf());
+        analysis.diagnostics.push(Diagnostic::new(
+            "tests.file-suffix",
+            "files containing test functions must end in `_tests.rs`",
+            input.relative.clone(),
+            input.source,
+            range.start,
+            range.end,
+        ));
+    }
+    analysis
 }
 
 pub(crate) fn analyze_inline_tests(
@@ -51,7 +179,7 @@ pub(crate) fn analyze_inline_tests(
         let mut edits = Vec::new();
         for (index, module) in modules.iter().enumerate() {
             let destination = test_destination(input.path, index);
-            if existing.contains(&destination) || analysis.creations.contains_key(&destination) {
+            if destination_conflicts(&destination, &existing, &analysis.creations) {
                 analysis.errors.push(OperationalError {
                     category: "planning",
                     message: format!(
@@ -106,6 +234,266 @@ pub(crate) fn analyze_inline_tests(
         }
     }
     analysis
+}
+
+fn extract_special_tests(
+    config: &Config,
+    input: &RustInput<'_>,
+    functions: &[Fn],
+    destination: PathBuf,
+    diagnostic_range: std::ops::Range<usize>,
+    analysis: &mut TestLayoutAnalysis,
+) {
+    if functions
+        .iter()
+        .any(|function| !test_condition_implies_test(function))
+    {
+        analysis.errors.push(OperationalError {
+            category: "test-layout",
+            message: format!(
+                "test functions in special Cargo entry {} must be conditional on `test`",
+                input.relative.display()
+            ),
+            paths: vec![input.relative.clone()],
+        });
+        return;
+    }
+    if destination_conflicts(&destination, &BTreeSet::new(), &analysis.creations) {
+        analysis.errors.push(OperationalError {
+            category: "planning",
+            message: format!(
+                "test extraction destination already exists: {}",
+                destination.display()
+            ),
+            paths: vec![config.relative(&destination)],
+        });
+        return;
+    }
+    let mut extracted = String::from("use crate::*;\n\n");
+    let mut source = input.source.to_owned();
+    let mut ranges: Vec<_> = functions
+        .iter()
+        .map(|function| text_range(function.syntax()))
+        .collect();
+    for range in &ranges {
+        extracted.push_str(input.source[range.clone()].trim());
+        extracted.push_str("\n\n");
+    }
+    extracted.truncate(extracted.trim_end().len());
+    extracted.push('\n');
+    ranges.sort_by_key(|range| range.start);
+    for range in ranges.into_iter().rev() {
+        let mut end = range.end;
+        while input.source.as_bytes().get(end) == Some(&b'\n') {
+            end += 1;
+        }
+        source.replace_range(range.start..end, "");
+    }
+    if !source.ends_with('\n') {
+        source.push('\n');
+    }
+    if !source.ends_with("\n\n") {
+        source.push('\n');
+    }
+    let module_name = destination
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("UTF-8 paths were checked");
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("UTF-8 paths were checked");
+    source.push_str(&format!(
+        "#[cfg(test)]\n#[path = \"{file_name}\"]\nmod {module_name};\n"
+    ));
+    analysis
+        .replacements
+        .insert(input.path.to_path_buf(), source);
+    analysis.creations.insert(destination, extracted);
+    analysis.diagnostics.push(Diagnostic::new(
+        "tests.file-suffix",
+        "test functions in Cargo entry files must be moved to a `_tests.rs` module",
+        input.relative.clone(),
+        input.source,
+        diagnostic_range.start,
+        diagnostic_range.end,
+    ));
+}
+
+fn test_condition_implies_test(function: &Fn) -> bool {
+    function.attrs().any(|attribute| {
+        let compact: String = attribute
+            .syntax()
+            .text()
+            .to_string()
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        compact == "#[test]"
+            || compact.starts_with("#[cfg(test)]")
+            || compact
+                .strip_prefix("#[cfg(all(")
+                .is_some_and(|arguments| arguments.split([',', ')']).any(|part| part == "test"))
+    })
+}
+
+fn is_test_function(config: &Config, function: &Fn) -> bool {
+    function.attrs().any(|attribute| {
+        let text = attribute.syntax().text().to_string();
+        recognized_attribute(config, &text)
+    })
+}
+
+fn recognized_attribute(config: &Config, text: &str) -> bool {
+    let compact: String = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let inner = compact
+        .strip_prefix("#[")
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(&compact);
+    if let Some(arguments) = inner.strip_prefix("cfg_attr(") {
+        return config.test_attributes.iter().any(|attribute| {
+            arguments.contains(attribute)
+                || attribute
+                    .rsplit("::")
+                    .next()
+                    .is_some_and(|leaf| leaf == "test" && arguments.contains("::test"))
+        });
+    }
+    let path = inner.split(['(', '=']).next().unwrap_or(inner).trim();
+    config.test_attributes.contains(path) || path.rsplit("::").next() == Some("test")
+}
+
+fn is_integration_test(relative: &Path) -> bool {
+    relative.parent() == Some(Path::new("tests"))
+}
+
+fn is_special_entry(relative: &Path) -> bool {
+    let file = relative.file_name().and_then(|name| name.to_str());
+    matches!(file, Some("lib.rs" | "main.rs" | "build.rs"))
+        || relative.starts_with("src/bin")
+        || relative.starts_with("examples")
+        || relative.starts_with("benches")
+}
+
+fn preserve_test_target(
+    source: &str,
+    name: &str,
+    original: &Path,
+    destination: &Path,
+) -> Result<String, ()> {
+    let mut document = source.parse::<DocumentMut>().map_err(|_| ())?;
+    let mut updated = false;
+    if let Some(targets) = document
+        .get_mut("test")
+        .and_then(Item::as_array_of_tables_mut)
+    {
+        for target in targets.iter_mut() {
+            if target.get("name").and_then(Item::as_str) != Some(name) {
+                continue;
+            }
+            let path = target.get("path").and_then(Item::as_str);
+            if path.is_some_and(|path| path != original.to_string_lossy()) {
+                return Err(());
+            }
+            target["path"] = toml_edit::value(destination.to_string_lossy().as_ref());
+            updated = true;
+            break;
+        }
+    }
+    if updated {
+        return Ok(document.to_string());
+    }
+    let mut replacement = source.to_owned();
+    if !replacement.ends_with('\n') {
+        replacement.push('\n');
+    }
+    let name = toml_edit::Value::from(name).to_string();
+    let path = toml_edit::Value::from(destination.to_string_lossy().as_ref()).to_string();
+    replacement.push_str(&format!("\n[[test]]\nname = {name}\npath = {path}\n"));
+    Ok(replacement)
+}
+
+fn destination_conflicts(
+    destination: &Path,
+    existing: &BTreeSet<PathBuf>,
+    creations: &BTreeMap<PathBuf, String>,
+) -> bool {
+    let key = destination.to_string_lossy().to_lowercase();
+    destination.exists()
+        || existing
+            .iter()
+            .any(|path| path.to_string_lossy().to_lowercase() == key)
+        || creations
+            .keys()
+            .any(|path| path.to_string_lossy().to_lowercase() == key)
+}
+
+fn rewrite_parent_declaration(
+    _config: &Config,
+    inputs: &[RustInput<'_>],
+    source: &Path,
+    destination: &Path,
+    analysis: &mut TestLayoutAnalysis,
+) -> bool {
+    for input in inputs {
+        if input.path == source {
+            continue;
+        }
+        let parsed = SourceFile::parse(input.source, Edition::Edition2024);
+        for module in parsed.tree().items().filter_map(|item| match item {
+            ast::Item::Module(module) if module.item_list().is_none() => Some(module),
+            _ => None,
+        }) {
+            let Some(name) = module.name().map(|name| name.text().to_string()) else {
+                continue;
+            };
+            let directory = module_directory(input.path);
+            let candidates = [
+                directory.join(format!("{name}.rs")),
+                directory.join(&name).join("mod.rs"),
+            ];
+            if !candidates.iter().any(|candidate| candidate == source) {
+                continue;
+            }
+            let relative_destination = destination
+                .strip_prefix(&directory)
+                .expect("moved module stays in its module directory");
+            let range = text_range(module.syntax());
+            let current = analysis
+                .replacements
+                .get(input.path)
+                .map_or(input.source, String::as_str);
+            let declaration = &input.source[range.clone()];
+            let replacement = format!(
+                "#[path = \"{}\"]\n{declaration}",
+                relative_destination.to_string_lossy()
+            );
+            let mut updated = current.to_owned();
+            let current_start = updated
+                .find(declaration)
+                .expect("external module declaration remains in virtual source");
+            updated.replace_range(
+                current_start..current_start + declaration.len(),
+                &replacement,
+            );
+            analysis
+                .replacements
+                .insert(input.path.to_path_buf(), updated);
+            return true;
+        }
+    }
+    false
+}
+
+fn module_directory(path: &Path) -> PathBuf {
+    let parent = path.parent().expect("module file has a parent");
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some("lib.rs" | "main.rs" | "mod.rs") => parent.to_path_buf(),
+        _ => parent.join(path.file_stem().expect("module file has a stem")),
+    }
 }
 
 fn test_destination(source: &Path, index: usize) -> PathBuf {
