@@ -214,19 +214,15 @@ struct Policy {
 impl Policy {
     fn from_item(item: &Item) -> Self {
         let string = item.as_str().map(str::to_owned);
-        let inline = item.as_inline_table();
         Self {
-            version: string.or_else(|| string_field(inline, "version")),
-            registry: string_field(inline, "registry"),
-            git: string_field(inline, "git"),
-            branch: string_field(inline, "branch"),
-            tag: string_field(inline, "tag"),
-            rev: string_field(inline, "rev"),
-            package: string_field(inline, "package"),
-            default_features: inline
-                .and_then(|table| table.get("default-features"))
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
+            version: string.or_else(|| string_field(item, "version")),
+            registry: string_field(item, "registry"),
+            git: string_field(item, "git"),
+            branch: string_field(item, "branch"),
+            tag: string_field(item, "tag"),
+            rev: string_field(item, "rev"),
+            package: string_field(item, "package"),
+            default_features: bool_field(item, "default-features").unwrap_or(true),
         }
     }
 }
@@ -310,6 +306,11 @@ fn workspace_policy_item(item: &Item) -> Item {
         table.remove("workspace");
         table.fmt();
     }
+    if let Some(table) = item.as_table_mut() {
+        table.remove("features");
+        table.remove("optional");
+        table.remove("workspace");
+    }
     item
 }
 
@@ -323,14 +324,33 @@ fn inherited_item(item: &Item) -> Item {
             }
         }
     }
+    if let Some(table) = item.as_table() {
+        for key in ["features", "optional"] {
+            if let Some(value) = table.get(key).and_then(Item::as_value) {
+                inherited.insert(key, value.clone());
+            }
+        }
+    }
     Item::Value(Value::InlineTable(inherited))
 }
 
-fn string_field(table: Option<&InlineTable>, key: &str) -> Option<String> {
-    table
-        .and_then(|table| table.get(key))
-        .and_then(Value::as_str)
+fn string_field(item: &Item, key: &str) -> Option<String> {
+    item.as_inline_table()
+        .and_then(|table| table.get(key).and_then(Value::as_str))
+        .or_else(|| {
+            item.as_table()
+                .and_then(|table| table.get(key).and_then(Item::as_str))
+        })
         .map(str::to_owned)
+}
+
+fn bool_field(item: &Item, key: &str) -> Option<bool> {
+    item.as_inline_table()
+        .and_then(|table| table.get(key).and_then(Value::as_bool))
+        .or_else(|| {
+            item.as_table()
+                .and_then(|table| table.get(key).and_then(Item::as_bool))
+        })
 }
 
 fn is_path(item: &Item) -> bool {
@@ -342,10 +362,7 @@ fn is_path(item: &Item) -> bool {
 }
 
 fn inherits_workspace(item: &Item) -> bool {
-    item.as_inline_table()
-        .and_then(|table| table.get("workspace"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+    bool_field(item, "workspace").unwrap_or(false)
 }
 
 fn find_dependency_range(source: &str, key: &str) -> std::ops::Range<usize> {

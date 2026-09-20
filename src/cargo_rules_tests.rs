@@ -25,6 +25,25 @@ fn inherited_entries_keep_only_member_features_and_optionality() {
 }
 
 #[test]
+fn table_dependencies_preserve_the_same_policy_as_inline_dependencies() {
+    let item: Item =
+        "[value]\nversion = \"1\"\ndefault-features = false\noptional = true\nfeatures = [\"x\"]\n"
+            .parse::<DocumentMut>()
+            .expect("document")
+            .remove("value")
+            .expect("item");
+
+    let policy = Policy::from_item(&item);
+    let inherited = inherited_item(&item).to_string();
+
+    assert_eq!(policy.version.as_deref(), Some("1"));
+    assert!(!policy.default_features);
+    assert!(inherited.contains("workspace = true"));
+    assert!(inherited.contains("optional = true"));
+    assert!(inherited.contains("features = [\"x\"]"));
+}
+
+#[test]
 fn promotes_compatible_member_policy_to_the_workspace() {
     let directory = tempdir().expect("temporary directory");
     let root_path = directory.path().join("Cargo.toml");

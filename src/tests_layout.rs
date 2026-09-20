@@ -26,6 +26,7 @@ pub(crate) fn analyze_file_suffix(
     manifests: &BTreeMap<PathBuf, String>,
 ) -> TestLayoutAnalysis {
     let mut analysis = TestLayoutAnalysis::default();
+    let declarations = parent_declaration_index(inputs);
     let existing: BTreeSet<_> = inputs
         .iter()
         .map(|input| input.path.to_path_buf())
@@ -76,13 +77,11 @@ pub(crate) fn analyze_file_suffix(
             continue;
         }
         if is_integration_test(&input.relative) {
-            let manifest = config.root.join("Cargo.toml");
-            let Some(manifest_source) = manifests.get(&manifest) else {
+            let Some((manifest, manifest_source)) = owning_manifest(input.path, manifests) else {
                 analysis.errors.push(OperationalError {
                     category: "test-layout",
-                    message: "an integration test move requires a readable root Cargo.toml"
-                        .to_owned(),
-                    paths: vec![PathBuf::from("Cargo.toml"), input.relative.clone()],
+                    message: "an integration test move requires an owning Cargo.toml".to_owned(),
+                    paths: vec![input.relative.clone()],
                 });
                 continue;
             };
@@ -91,29 +90,36 @@ pub(crate) fn analyze_file_suffix(
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .expect("UTF-8 paths were checked");
-            let destination_relative = config.relative(&destination);
+            let manifest_directory = manifest.parent().expect("manifest has a parent");
+            let original_relative = input
+                .path
+                .strip_prefix(manifest_directory)
+                .expect("test is below its owning manifest");
+            let destination_relative = destination
+                .strip_prefix(manifest_directory)
+                .expect("test destination is below its owning manifest");
             let current_manifest = analysis
                 .replacements
-                .get(&manifest)
+                .get(manifest)
                 .unwrap_or(manifest_source);
             let Ok(replacement) = preserve_test_target(
                 current_manifest,
                 target_name,
-                &input.relative,
-                &destination_relative,
+                original_relative,
+                destination_relative,
             ) else {
                 analysis.errors.push(OperationalError {
                     category: "planning",
                     message: format!(
                         "Cargo test target `{target_name}` already points to a different path"
                     ),
-                    paths: vec![PathBuf::from("Cargo.toml"), input.relative.clone()],
+                    paths: vec![config.relative(manifest), input.relative.clone()],
                 });
                 continue;
             };
-            analysis.replacements.insert(manifest, replacement);
+            analysis.replacements.insert(manifest.clone(), replacement);
         } else if !rewrite_parent_declaration(
-            config,
+            &declarations,
             inputs,
             input.path,
             &destination,
@@ -367,7 +373,24 @@ fn recognized_attribute(config: &Config, text: &str) -> bool {
 }
 
 fn is_integration_test(relative: &Path) -> bool {
-    relative.parent() == Some(Path::new("tests"))
+    relative
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "tests")
+}
+
+fn owning_manifest<'a>(
+    path: &Path,
+    manifests: &'a BTreeMap<PathBuf, String>,
+) -> Option<(&'a PathBuf, &'a String)> {
+    manifests
+        .iter()
+        .filter(|(manifest, _)| {
+            manifest
+                .parent()
+                .is_some_and(|directory| path.starts_with(directory))
+        })
+        .max_by_key(|(manifest, _)| manifest.components().count())
 }
 
 fn is_special_entry(relative: &Path) -> bool {
@@ -432,16 +455,55 @@ fn destination_conflicts(
 }
 
 fn rewrite_parent_declaration(
-    _config: &Config,
+    declarations: &BTreeMap<PathBuf, Vec<ParentDeclaration>>,
     inputs: &[RustInput<'_>],
     source: &Path,
     destination: &Path,
     analysis: &mut TestLayoutAnalysis,
 ) -> bool {
+    let Some(declaration) = declarations.get(source).and_then(|items| items.first()) else {
+        return false;
+    };
+    let input = inputs
+        .iter()
+        .find(|input| input.path == declaration.owner)
+        .expect("indexed parent input exists");
+    let relative_destination = destination
+        .strip_prefix(&declaration.directory)
+        .expect("moved module stays in its module directory");
+    let current = analysis
+        .replacements
+        .get(input.path)
+        .map_or(input.source, String::as_str);
+    let replacement = format!(
+        "#[path = \"{}\"]\n{}",
+        relative_destination.to_string_lossy(),
+        declaration.text
+    );
+    let mut updated = current.to_owned();
+    let current_start = updated
+        .find(&declaration.text)
+        .expect("external module declaration remains in virtual source");
+    updated.replace_range(
+        current_start..current_start + declaration.text.len(),
+        &replacement,
+    );
+    analysis
+        .replacements
+        .insert(input.path.to_path_buf(), updated);
+    true
+}
+
+#[derive(Clone, Debug)]
+struct ParentDeclaration {
+    owner: PathBuf,
+    directory: PathBuf,
+    text: String,
+}
+
+fn parent_declaration_index(inputs: &[RustInput<'_>]) -> BTreeMap<PathBuf, Vec<ParentDeclaration>> {
+    let mut declarations: BTreeMap<PathBuf, Vec<ParentDeclaration>> = BTreeMap::new();
     for input in inputs {
-        if input.path == source {
-            continue;
-        }
         let parsed = SourceFile::parse(input.source, Edition::Edition2024);
         for module in parsed.tree().items().filter_map(|item| match item {
             ast::Item::Module(module) if module.item_list().is_none() => Some(module),
@@ -451,49 +513,40 @@ fn rewrite_parent_declaration(
                 continue;
             };
             let directory = module_directory(input.path);
-            let candidates = [
+            let declaration = ParentDeclaration {
+                owner: input.path.to_path_buf(),
+                directory: directory.clone(),
+                text: module.syntax().text().to_string(),
+            };
+            for candidate in [
                 directory.join(format!("{name}.rs")),
-                directory.join(&name).join("mod.rs"),
-            ];
-            if !candidates.iter().any(|candidate| candidate == source) {
-                continue;
+                directory.join(name).join("mod.rs"),
+            ] {
+                declarations
+                    .entry(candidate)
+                    .or_default()
+                    .push(declaration.clone());
             }
-            let relative_destination = destination
-                .strip_prefix(&directory)
-                .expect("moved module stays in its module directory");
-            let range = text_range(module.syntax());
-            let current = analysis
-                .replacements
-                .get(input.path)
-                .map_or(input.source, String::as_str);
-            let declaration = &input.source[range.clone()];
-            let replacement = format!(
-                "#[path = \"{}\"]\n{declaration}",
-                relative_destination.to_string_lossy()
-            );
-            let mut updated = current.to_owned();
-            let current_start = updated
-                .find(declaration)
-                .expect("external module declaration remains in virtual source");
-            updated.replace_range(
-                current_start..current_start + declaration.len(),
-                &replacement,
-            );
-            analysis
-                .replacements
-                .insert(input.path.to_path_buf(), updated);
-            return true;
         }
     }
-    false
+    declarations
 }
 
 fn module_directory(path: &Path) -> PathBuf {
     let parent = path.parent().expect("module file has a parent");
     match path.file_name().and_then(|name| name.to_str()) {
         Some("lib.rs" | "main.rs" | "mod.rs") => parent.to_path_buf(),
+        _ if is_automatic_target_root(path) => parent.to_path_buf(),
         _ => parent.join(path.file_stem().expect("module file has a stem")),
     }
+}
+
+fn is_automatic_target_root(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let directory = parent.file_name().and_then(|name| name.to_str());
+    matches!(directory, Some("tests" | "examples" | "benches" | "bin"))
 }
 
 fn test_destination(source: &Path, index: usize) -> PathBuf {
