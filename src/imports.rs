@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::path::PathBuf;
 
-use ra_ap_syntax::ast::{self, AstNode, HasModuleItem};
+use ra_ap_syntax::ast::{self, AstNode, HasModuleItem, HasName, HasVisibility};
 use ra_ap_syntax::{Edition, SourceFile};
 
 use crate::config::Config;
@@ -14,6 +15,81 @@ use ra_ap_syntax::ast::Item;
 use ra_ap_syntax::ast::ItemList;
 use ra_ap_syntax::ast::Module;
 use ra_ap_syntax::ast::Use;
+use ra_ap_syntax::ast::Visibility;
+
+#[derive(Clone, Debug)]
+pub(crate) struct RustInput<'a> {
+    pub(crate) path: &'a Path,
+    pub(crate) relative: PathBuf,
+    pub(crate) source: &'a str,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PublicFunctionAnalysis {
+    pub(crate) diagnostics: Vec<Diagnostic>,
+    pub(crate) replacements: BTreeMap<PathBuf, String>,
+}
+
+pub(crate) fn analyze_public_functions(
+    config: &Config,
+    inputs: &[RustInput<'_>],
+) -> PublicFunctionAnalysis {
+    let public_functions = public_function_index(inputs);
+    let mut analysis = PublicFunctionAnalysis::default();
+    for input in inputs {
+        if !config.rule_enabled("imports.public-function", &input.relative) {
+            continue;
+        }
+        let parsed = SourceFile::parse(input.source, Edition::Edition2024);
+        let file = parsed.tree();
+        let mut candidates = Vec::new();
+        for import in file.syntax().descendants().filter_map(Use::cast) {
+            if import.visibility().is_some() {
+                continue;
+            }
+            let text = import.syntax().text().to_string();
+            let Some((path, binding)) = simple_import(&text) else {
+                continue;
+            };
+            let canonical = canonical_import_path(&path, input.relative.as_path());
+            if !public_functions.contains(&canonical) && !standard_public_function(&canonical) {
+                continue;
+            }
+            let parent = canonical
+                .rsplit_once("::")
+                .map(|(parent, _)| parent)
+                .expect("function path has a parent");
+            let qualifier = parent.rsplit("::").next().expect("module has a leaf");
+            let function_name = canonical.rsplit("::").next().expect("function has a name");
+            candidates.push(PublicFunctionImport {
+                diagnostic_range: text_range(import.syntax()),
+                removal_range: complete_line_range(input.source, text_range(import.syntax())),
+                binding,
+                function_name: function_name.to_owned(),
+                qualifier: qualifier.to_owned(),
+                module_path: parent.to_owned(),
+            });
+        }
+        if candidates.is_empty() {
+            continue;
+        }
+        let replacement = rewrite_public_function_imports(input.source, &file, &candidates);
+        for candidate in &candidates {
+            analysis.diagnostics.push(Diagnostic::new(
+                "imports.public-function",
+                "unrestricted public functions must be called through their module",
+                input.relative.clone(),
+                input.source,
+                candidate.diagnostic_range.start,
+                candidate.diagnostic_range.end,
+            ));
+        }
+        analysis
+            .replacements
+            .insert(input.path.to_path_buf(), replacement);
+    }
+    analysis
+}
 
 pub(crate) fn check_top_level(config: &Config, relative: &Path, source: &str) -> Vec<Finding> {
     if !config.rule_enabled("imports.top-level", relative) {
@@ -87,6 +163,177 @@ struct NestedImport {
     text: String,
     leaf: Option<String>,
     condition: String,
+}
+
+#[derive(Clone, Debug)]
+struct PublicFunctionImport {
+    diagnostic_range: std::ops::Range<usize>,
+    removal_range: std::ops::Range<usize>,
+    binding: String,
+    function_name: String,
+    qualifier: String,
+    module_path: String,
+}
+
+fn public_function_index(inputs: &[RustInput<'_>]) -> BTreeSet<String> {
+    let mut functions = BTreeSet::new();
+    for input in inputs {
+        let Some(module) = physical_module(&input.relative) else {
+            continue;
+        };
+        let parsed = SourceFile::parse(input.source, Edition::Edition2024);
+        collect_public_functions(parsed.tree().items().collect(), &module, &mut functions);
+    }
+    functions
+}
+
+fn collect_public_functions(items: Vec<Item>, module: &[String], functions: &mut BTreeSet<String>) {
+    for item in items {
+        match item {
+            ast::Item::Fn(function) if unrestricted_public(function.visibility()) => {
+                if let Some(name) = function.name() {
+                    let mut path = vec!["crate".to_owned()];
+                    path.extend_from_slice(module);
+                    path.push(name.text().to_string());
+                    functions.insert(path.join("::"));
+                }
+            }
+            ast::Item::Module(module_item) => {
+                if let Some(list) = module_item.item_list()
+                    && let Some(name) = module_item.name()
+                {
+                    let mut nested = module.to_vec();
+                    nested.push(name.text().to_string());
+                    collect_public_functions(list.items().collect(), &nested, functions);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn unrestricted_public(visibility: Option<Visibility>) -> bool {
+    visibility.is_some_and(|visibility| visibility.syntax().text().to_string().trim() == "pub")
+}
+
+fn simple_import(text: &str) -> Option<(String, String)> {
+    if text.contains(['{', '*']) {
+        return None;
+    }
+    let import = text
+        .trim()
+        .rsplit_once("use ")
+        .map(|(_, import)| import)?
+        .trim_end_matches(';');
+    let (path, binding) = import.rsplit_once(" as ").map_or_else(
+        || (import, import.rsplit("::").next().unwrap_or(import)),
+        |(path, alias)| (path.trim(), alias.trim()),
+    );
+    Some((path.to_owned(), binding.to_owned()))
+}
+
+fn canonical_import_path(path: &str, relative: &Path) -> String {
+    if path.starts_with("crate::") || path.starts_with("std::") {
+        return path.to_owned();
+    }
+    if let Some(remainder) = path.strip_prefix("self::") {
+        let mut module = physical_module(relative).unwrap_or_default();
+        module.push(remainder.to_owned());
+        return format!("crate::{}", module.join("::"));
+    }
+    path.to_owned()
+}
+
+fn rewrite_public_function_imports(
+    source: &str,
+    file: &ast::SourceFile,
+    candidates: &[PublicFunctionImport],
+) -> String {
+    let mut edits = Vec::new();
+    let mut modules = BTreeSet::new();
+    for candidate in candidates {
+        edits.push(Edit {
+            range: candidate.removal_range.clone(),
+            replacement: String::new(),
+        });
+        modules.insert(candidate.module_path.clone());
+        for expression in file.syntax().descendants().filter_map(ast::PathExpr::cast) {
+            let Some(path) = expression.path() else {
+                continue;
+            };
+            if path.syntax().text().to_string() == candidate.binding
+                && !expression
+                    .syntax()
+                    .ancestors()
+                    .any(|ancestor| Use::can_cast(ancestor.kind()))
+            {
+                edits.push(Edit {
+                    range: text_range(path.syntax()),
+                    replacement: format!("{}::{}", candidate.qualifier, candidate.function_name),
+                });
+            }
+        }
+    }
+    let insertion = insertion_for_items(file.items().collect(), source).unwrap_or(0);
+    let imports = modules
+        .into_iter()
+        .filter(|module| !source.contains(&format!("use {module};")))
+        .map(|module| format!("use {module};\n"))
+        .collect::<String>();
+    if !imports.is_empty() {
+        edits.push(Edit {
+            range: insertion..insertion,
+            replacement: imports,
+        });
+    }
+    edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
+    edits
+        .dedup_by(|left, right| left.range == right.range && left.replacement == right.replacement);
+    let mut replacement = source.to_owned();
+    for edit in edits.into_iter().rev() {
+        replacement.replace_range(edit.range, &edit.replacement);
+    }
+    replacement
+}
+
+fn standard_public_function(path: &str) -> bool {
+    matches!(
+        path,
+        "std::cmp::max"
+            | "std::cmp::min"
+            | "std::convert::identity"
+            | "std::fs::canonicalize"
+            | "std::fs::copy"
+            | "std::fs::create_dir"
+            | "std::fs::create_dir_all"
+            | "std::fs::read"
+            | "std::fs::read_dir"
+            | "std::fs::read_to_string"
+            | "std::fs::remove_dir"
+            | "std::fs::remove_dir_all"
+            | "std::fs::remove_file"
+            | "std::fs::rename"
+            | "std::fs::set_permissions"
+            | "std::fs::write"
+            | "std::mem::drop"
+            | "std::mem::forget"
+            | "std::thread::sleep"
+    )
+}
+
+fn physical_module(relative: &Path) -> Option<Vec<String>> {
+    let components: Vec<_> = relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str().map(str::to_owned))
+        .collect();
+    let source = components.iter().position(|component| component == "src")?;
+    let mut module = components[source + 1..].to_vec();
+    let file = module.pop()?;
+    match file.as_str() {
+        "lib.rs" | "main.rs" | "mod.rs" => {}
+        _ => module.push(file.trim_end_matches(".rs").to_owned()),
+    }
+    Some(module)
 }
 
 fn is_module_level(import: &Use) -> bool {
@@ -215,7 +462,30 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::config::Config;
-    use crate::imports::check_top_level;
+    use crate::imports::{RustInput, analyze_public_functions, check_top_level};
+
+    #[test]
+    fn rewrites_direct_public_function_imports_through_the_module() {
+        let directory = tempdir().expect("temporary directory");
+        let manifest = directory.path().join("Cargo.toml");
+        fs::write(&manifest, "[workspace]\nmembers=[]\n").expect("manifest");
+        let config = Config::load(directory.path(), None).expect("configuration");
+        let source_path = directory.path().join("src/lib.rs");
+        let source = "pub mod cards { pub fn shuffle() {} }\nuse crate::cards::shuffle;\nfn play() { shuffle(); }\n";
+        let inputs = [RustInput {
+            path: &source_path,
+            relative: "src/lib.rs".into(),
+            source,
+        }];
+
+        let analysis = analyze_public_functions(&config, &inputs);
+
+        assert_eq!(analysis.diagnostics.len(), 1);
+        let fixed = &analysis.replacements[&source_path];
+        assert!(fixed.contains("use crate::cards;"));
+        assert!(!fixed.contains("use crate::cards::shuffle;"));
+        assert!(fixed.contains("cards::shuffle();"));
+    }
 
     #[test]
     fn hoists_function_imports_to_the_file_module() {

@@ -13,6 +13,7 @@ use crate::cli::{Cli, OutputFormat};
 use crate::config::Config;
 use crate::diagnostic::{Diagnostic, JsonOutput, OperationalError, Summary, Timings};
 use crate::discovery;
+use crate::imports::RustInput;
 use crate::rules;
 use crate::rules::Edit;
 use crate::transaction::{self, Change};
@@ -91,12 +92,25 @@ pub(crate) fn run(cli: &Cli) -> ExitCode {
     let workspace = cargo_rules::analyze_workspace(&config, &manifest_inputs);
     diagnostics.extend(workspace.diagnostics);
     errors.extend(workspace.errors);
+    let rust_inputs: Vec<_> = parsed
+        .iter()
+        .filter(|file| file.path.extension() == Some(OsStr::new("rs")))
+        .map(|file| RustInput {
+            path: &file.path,
+            relative: config.relative(&file.path),
+            source: &file.source,
+        })
+        .collect();
+    let public_functions = crate::imports::analyze_public_functions(&config, &rust_inputs);
+    diagnostics.extend(public_functions.diagnostics);
+    let mut project_replacements = workspace.replacements;
+    project_replacements.extend(public_functions.replacements);
     if let Some(timings) = &mut summary.timings {
         timings.rule_evaluation_ms = milliseconds(evaluation_started.elapsed());
     }
 
     if cli.fix && errors.is_empty() && !diagnostics.is_empty() {
-        match plan_changes(&config, &parsed, &workspace.replacements) {
+        match plan_changes(&config, &parsed, &project_replacements) {
             Ok(changes) => {
                 let inventory = inventory(&config, &parsed);
                 match transaction::apply(&config, &changes, &inventory) {
