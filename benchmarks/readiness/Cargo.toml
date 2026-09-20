@@ -1,0 +1,7 @@
+[package]
+name = "stylon-readiness"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+ra_ap_syntax = "=0.0.350"
+rayon = "1"

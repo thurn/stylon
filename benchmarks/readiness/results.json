@@ -1,0 +1,81 @@
+{
+  "parse_and_walk": {
+    "runs_seconds": [
+      0.02591070899507031,
+      0.022634707973338664,
+      0.02543020900338888,
+      0.021683583967387676,
+      0.0244291250128299,
+      0.0240652080392465,
+      0.022817542019765824,
+      0.023400374979246408,
+      0.023560041037853807,
+      0.02171016699867323,
+      0.021912458003498614,
+      0.024616832961328328,
+      0.020853416004683822,
+      0.023321291024331003,
+      0.021966332977171987,
+      0.02217854099581018,
+      0.024260375008452684,
+      0.022913374996278435,
+      0.02673775004222989,
+      0.025949792005121708
+    ],
+    "median_seconds": 0.023360833001788706,
+    "p95_seconds": 0.025949792005121708,
+    "counts": "files=480 bytes=4293719 nodes=1013539 errors=0"
+  },
+  "all_metadata": {
+    "runs_seconds": [
+      0.11878995801089332,
+      0.12247358402237296,
+      0.12438287498662248,
+      0.12281370803248137,
+      0.13233533303719014,
+      0.1360782909905538,
+      0.12597491597989574,
+      0.11960537504637614,
+      0.1239373330026865,
+      0.11620408302405849,
+      0.12894920795224607,
+      0.1308719579828903,
+      0.13084454199997708,
+      0.11277562502073124,
+      0.11351004202151671,
+      0.10933366703102365,
+      0.10897491598734632,
+      0.11244695802452043,
+      0.10942866699770093,
+      0.12003033299697563
+    ],
+    "median_seconds": 0.1212519585096743,
+    "p95_seconds": 0.13233533303719014
+  },
+  "revision": "725660cccf08e66d2151ad5c5566fc4245e7070d",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "cargo": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+  "metadata_invocations": [
+    "Cargo.toml",
+    "samples/basic/rules/Cargo.toml",
+    "samples/chess/rules/Cargo.toml",
+    "samples/reactant/rules/Cargo.toml",
+    "samples/tictactoe/rules/Cargo.toml",
+    "samples/ui/rules/Cargo.toml",
+    "crates/battlement-reactant/tests/fixtures/asset-registry/Cargo.toml"
+  ],
+  "tracked_rust_lines": 141784,
+  "binary_sha256": "d849a4c560e799f5d5c1e0a6d972a7d77fd10186aaab11db8dddb7b01b1a2cb4",
+  "lock_sha256": "a3736cf24fa6971f77345a2f1dc1cddd814b1230ad49520901156644b88cb621",
+  "macos": "ProductName:\t\tmacOS\nProductVersion:\t\t26.5.2\nBuildVersion:\t\t25F84\n",
+  "hardware": "hw.model: Mac17,6\nhw.memsize: 68719476736\nhw.ncpu: 18\nmachdep.cpu.brand_string: Apple M5 Max\n",
+  "power_settings": "Battery Power:\n Sleep On Power Button 1\n powermode            2\n standby              1\n ttyskeepawake        1\n hibernatemode        3\n powernap             1\n hibernatefile        /var/vm/sleepimage\n displaysleep         0\n womp                 0\n networkoversleep     0\n sleep                1\n lessbright           0\n tcpkeepalive         1\n disksleep            10\nAC Power:\n Sleep On Power Button 1\n powermode            0\n standby              1\n ttyskeepawake        1\n hibernatemode        3\n powernap             1\n hibernatefile        /var/vm/sleepimage\n displaysleep         0\n womp                 1\n networkoversleep     0\n sleep                0\n tcpkeepalive         1\n disksleep            10\n",
+  "limitations": [
+    "Component measurements, not complete scanner or fixer.",
+    "Only tracked Rust/Cargo inputs exported; Git-aware traversal and full ignored trees are not measured.",
+    "Parse workers walk nodes then discard trees; retained index and trees not measured.",
+    "Source files parsed as edition 2024.",
+    "OS file cache warm; other desktop activity not controlled.",
+    "Metadata timing uses exported corpus root as working directory for all seven calls; production uses each manifest directory."
+  ]
+}

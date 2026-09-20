@@ -12,7 +12,7 @@ The design has four controlling requirements:
 
 - A full scan of a 100,000-line Rust project must finish in at most five
   seconds. The acceptance corpus is larger: Battlement currently contains
-  138,483 tracked Rust lines.
+  141,784 tracked Rust lines at the pinned revision.
 - Every style finding must have a deterministic machine-applicable fix.
   Conditions that prevent a safe fix are operational errors, not unfixable
   style findings.
@@ -22,13 +22,39 @@ The design has four controlling requirements:
   through one root `stylon.toml`. Source annotations and line-level suppression
   comments have no effect.
 
-Stylon meets the performance requirement by parsing source directly, building
-only the project facts needed by its rules, and never invoking `rustc` or the
-rust-analyzer semantic engine during a normal scan. It meets the fix guarantee
-by composing all edits in memory, proving that the result parses and is clean,
-then using recoverable writes and Cargo validation.
+Stylon parses source directly and builds only the facts its rules need; normal
+scans do not invoke `rustc` or the rust-analyzer semantic engine. Initial
+measurements support the five-second target, but a complete scanner and fixer
+must pass the benchmarks before this is a verified product claim. Parsing and a
+clean scan do not prove semantic equivalence: fixes also require conservative
+resolution checks and the configured validation command.
 
-Rust 1.94 is the initial minimum supported Rust version for building Stylon.
+Rust 1.98 is the initial minimum supported Rust version for building Stylon,
+matching `ra_ap_syntax` 0.0.350. Commit a tested dependency lockfile; pinning the
+parser alone does not pin its transitive dependencies. Analyzed projects may use
+older editions and toolchains.
+
+## Implementation Readiness
+
+The design is ready for a staged implementation, not an unconditional promise
+of automatic repair for arbitrary Rust. The remaining gates are explicit:
+
+1. Build discovery, parsing, the diagnostic model, and the two item-layout rules
+   first. Measure the complete scan on pinned Battlement before adding a resolver.
+2. Add Cargo edits and a minimal, conservative module/import resolver. Fixture
+   tests must cover shadowing, re-exports, conditional modules, macro use, and
+   references used as values before enabling name-changing fixes.
+3. Add test-file changes and import/path fixes through the same planner. Prove
+   module and Cargo target identities survive each structural edit. Keep
+   unsupported cases as operational errors; do not claim a compiler-equivalent
+   resolver or silently guess.
+4. Complete crash recovery, failing-validation tests, and the dirty-corpus fix
+   benchmark before shipping `--fix`.
+
+Ordinary items may remain in `lib.rs` and `mod.rs`. There is no special root
+layout convention, implementation-module extraction, visibility widening, or
+root re-export synthesis. Test layout and import placement retain their
+separately documented rules.
 
 ## Related Information
 
@@ -48,6 +74,11 @@ Rust 1.94 is the initial minimum supported Rust version for building Stylon.
 [cargo-workspaces]: https://doc.rust-lang.org/cargo/reference/workspaces.html
 [rustdoc-links]: https://doc.rust-lang.org/rustdoc/write-documentation/linking-to-items-by-name.html
 [battlement-revision]: https://github.com/thurn/battlement/tree/725660cccf08e66d2151ad5c5566fc4245e7070d
+[cargo-metadata]: https://doc.rust-lang.org/cargo/commands/cargo-metadata.html
+[cargo-targets]: https://doc.rust-lang.org/cargo/reference/cargo-targets.html
+[rust-modules]: https://doc.rust-lang.org/reference/items/modules.html
+[rust-macros]: https://doc.rust-lang.org/reference/macros-by-example.html
+[rustdoc-json]: https://doc.rust-lang.org/nightly/rustdoc/unstable-features.html
 
 ## User Interface
 
@@ -108,7 +139,7 @@ partial result.
     "fix": "machine-applicable"
   }],
   "errors": [],
-  "summary": {"files": 469, "findings": 1, "fixed": 0, "remaining": 1}
+  "summary": {"files": 480, "findings": 1, "fixed": 0, "remaining": 1}
 }
 ```
 
@@ -271,50 +302,51 @@ path crossing outside the analysis root is an operational error. Filesystem
 boundaries are allowed only when the canonical path remains below the analysis
 root.
 
-Stylon canonicalizes discovered manifests, walks their Cargo workspace
-ownership, and retains only the outermost owning invocation for each package.
-Cargo metadata itself may create or update `Cargo.lock`, so Stylon never runs it
-in the source tree. It creates a temporary **metadata sandbox** that mirrors
-manifest-relative directories, Cargo configuration, every discovered manifest,
-the existing lockfile if present, and empty files at declared or conventional
-target entry paths. Path dependencies remain at the same relative locations.
-No source bytes are needed for metadata.
-
-It invokes the following command inside that sandbox once for each distinct
-workspace and once for each package not owned by a workspace:
+Stylon obtains package and target identity directly from Cargo; it does not
+reimplement workspace membership or create a synthetic source tree. Canonicalize
+manifests, query the root workspace first, and skip member manifests already
+returned by that query. Query each remaining independent package/workspace once,
+from its manifest directory:
 
 ```text
-cargo metadata --no-deps --format-version 1 --manifest-path ABSOLUTE_PATH
+cargo metadata --no-deps --format-version 1 --frozen --manifest-path ABSOLUTE_PATH
 ```
 
-The subprocess inherits the environment and uses the mirrored Cargo
-configuration because those define the actual project. Its working directory is
-the mirrored manifest parent. Returned canonical paths are mapped back to their
-source-tree witnesses; a path escaping the mirrored analysis root is an error.
-Sandbox files and any generated lockfile are deleted after reading the result,
-so check mode is read-only even when the project has no lockfile. Metadata
-failure is a `cargo-metadata` operational error. Stylon supports the Cargo
-shipped with Rust 1.94 or newer. Metadata identifies
-workspace membership, package targets, crate roots, explicit test targets, and
-proc-macro crates. It does not load dependency source or build the project.
+[`--no-deps`][cargo-metadata] omits dependency resolution; `--frozen` prohibits
+network access and lockfile changes. The readiness probe succeeded both on the
+pinned corpus and on a package with no lockfile and an unavailable dependency.
+Keep these as regression fixtures for supported Cargo versions. A Cargo failure
+is an operational error, never a reason to retry with network or lockfile writes
+enabled. There is no metadata sandbox or dependency-source scan.
+
+Metadata identifies workspace members, target names, entry files, editions, and
+proc-macro crates. External path dependencies may be recorded as dependencies,
+but source outside the analysis root is not indexed or rewritten. Metadata calls
+and discovery of independent sample/fixture workspaces count toward scan time.
 
 Module identity is built by starting at every Cargo target root and recursively
 following external `mod` declarations and literal `#[path]` attributes. A
 declaration without `#[path]` considers exactly Rust's two conventional
-candidates: `name.rs` and `name/mod.rs` relative to its module directory. Zero
-or two existing candidates is an error when the declaration affects a selected
-file. Literal `include!` source participates in the enclosing module but remains
-a distinct physical file.
+candidates: `name.rs` and `name/mod.rs` relative to its module directory.
+Two existing candidates are ambiguous. A missing conditional module can refer
+to generated or platform-specific source; record it as unresolved and report an
+error only when an enabled fix needs that identity. An unconditional missing
+selected module is an error. Follow the [Rust module lookup rules][rust-modules],
+including inline-module directories and `#[path]`, rather than treating all paths
+as relative to the physical file. A file may belong to multiple targets; retain
+all identities and require a proposed edit to agree in every context.
+Literal `include!` source is parsed in its inclusion context and remains a
+distinct physical file; unsupported expression/type fragments are opaque, not
+incorrectly parsed as complete source files.
 
-An unattached file under a unique package source directory receives the module
-path implied by its relative `.rs` path. Otherwise it receives local syntax
-rules only. A rule requiring module, visibility, or Cargo identity reports an
-analysis error for that file rather than guessing. Local rules are item spacing,
-item ordering, import placement, and syntactically self-contained path checks;
-all other rules require project identity when they construct a fix.
+An unattached file receives self-contained syntax rules only. Its filename is not proof
+of a Rust module identity. A rule requiring module, visibility, or Cargo identity
+reports an analysis error for that file rather than guessing. Item spacing and ordering can operate locally. Any import/path fix requiring
+module identity must fail analysis rather than invent one.
 
-Conditional declarations are indexed as alternatives after normalizing
-`cfg`, compound `cfg(all/any/not)`, and literal `cfg_attr` predicates. Stylon
+Conditional declarations are retained as alternatives with their `cfg` and
+literal `cfg_attr` predicates. Use conservative structural checks, not a general
+Boolean solver; an unproved relationship remains unknown. Stylon
 does not evaluate them for the host. A reference is unambiguous only when every
 alternative that could define the name leads to the same canonical item and
 module. Otherwise a fix depending on that reference is an analysis error.
@@ -331,13 +363,17 @@ correctness cache and no compiler process.
 
 ### Lossless syntax
 
-Stylon pins `ra_ap_syntax = "=0.0.350"`. The rust-analyzer syntax API is not a
-stable compatibility boundary, so upgrades require the complete parser and
-Battlement corpus tests before changing the pin.
+Stylon pins `ra_ap_syntax = "=0.0.350"` and commits `Cargo.lock`. The readiness
+probe required `unicode-ident = 1.0.24` in the lockfile: 1.0.26 uses Unicode 18,
+while the lexer's `unicode-properties` 0.1.4 uses Unicode 17 and rejects that
+combination at compile time. The rust-analyzer syntax API is not a
+stable compatibility boundary; upgrades require the parser and Battlement tests.
 
 The parser retains comments, whitespace, attributes, and exact byte ranges.
-Each file produces both a syntax tree and a compact set of facts during one
-walk:
+Each worker parses a file and extracts compact, owned facts in one walk. Keep
+red syntax nodes local to the worker; only owned facts and shareable immutable
+green trees cross worker boundaries. A rule worker reconstructs its local tree
+view without reparsing. Facts include:
 
 - item kind, name, visibility, attributes, and complete source range;
 - imports and the scopes containing them;
@@ -369,14 +405,18 @@ It contains:
 The standard-library index is generated from Rust 1.94 rustdoc JSON, normalized
 to sorted records of public path, item kind, and canonical module, reviewed in
 the same change as any Rust-version update, and compiled into the binary.
-Generation is reproducible from the pinned toolchain and a checked-in command;
-runtime analysis does not scan the sysroot. Standard path aliases are resolved
+Rustdoc JSON generation requires [unstable rustdoc support][rustdoc-json]; the
+implementation must pin a compatible generator toolchain and matching standard
+library source, check in the generated artifact and command, and test its
+contents before enabling standard-library function-import checks. This is a
+build-time gate, not a claim that stable Rust 1.94 can emit JSON unaided. Runtime
+analysis does not scan the sysroot. APIs absent from the embedded version are
+unknown, not guessed from capitalization. Standard path aliases are resolved
 through imports, so `fs::File` inherits the exemption of `std::fs::File`.
 
 Third-party dependency APIs are not indexed. Direct-function-import checking
-covers project and standard-library public functions. Syntax-position rules
-still normalize third-party type and variant paths without loading dependency
-source.
+covers project and standard-library public functions. Syntax-position rules may normalize unambiguous third-party type paths, but
+variant and associated-call classification must respect the resolution boundary.
 
 ### Macro boundary
 
@@ -384,7 +424,8 @@ Arbitrary macro token trees are opaque. Stylon may inspect a macro's path,
 attributes, delimiter range, and top-level position, but it never interprets or
 rewrites Rust-looking tokens inside the invocation.
 
-Unknown top-level macro declarations and invocations are ordering barriers.
+Unknown top-level macro declarations and invocations are ordering barriers,
+because [macro textual scope][rust-macros] depends on source order.
 Items on opposite sides are not compared for ordering and are never moved
 across the barrier. `thread_local!` and configured constant-defining macros are
 known items rather than barriers.
@@ -401,8 +442,7 @@ facts, and check function against immutable context.
 
 An **interest** selects syntax or manifest facts that cause a rule to run. A
 **change recipe** is a declarative set of byte edits, creates, moves, deletes,
-visibility changes, or manifest operations plus hashes and resolution
-preconditions. A **known public path** is a bare-`pub` path reachable from a
+or manifest operations plus hashes and resolution preconditions. A **known public path** is a bare-`pub` path reachable from a
 Cargo target root through declarations or re-exports. Restricted visibility
 means every `pub(...)` form; **unrestricted public** always means bare `pub`.
 
@@ -449,14 +489,14 @@ treated as a clean run.
 ## Fix Planning and Transactions
 
 Fix mode separates deciding changes from writing them. This is necessary
-because a module extraction can create imports that another rule must rewrite,
+because a test extraction can create imports that another rule must rewrite,
 and two independently correct edits can overlap.
 
 Planning uses a virtual filesystem initialized from the immutable scan. It
 applies rule changes in a deterministic priority order:
 
 1. manifest and filesystem structure changes;
-2. module and test extraction or renaming;
+2. inline-module/test extraction or file renaming;
 3. import and path rewrites;
 4. item ordering; and
 5. blank-line normalization.
@@ -466,15 +506,19 @@ and source offset. Identical replacements and operations carrying the same
 shared-planner key are merged. Any other overlapping byte ranges, moves, or
 manifest fields conflict.
 
-After each pass, changed virtual files are reparsed. Stylon conservatively
+Each priority stage consumes fresh ranges from the current virtual snapshot;
+edits within a file apply from highest byte offset to lowest. Reparse changed
+files between stages before running the next stage. Never apply original-scan
+ranges after an earlier stage moved or rewrote text. After each pass, changed
+virtual files are reparsed as needed. Stylon conservatively
 rebuilds the module, import, symbol, test, and manifest facts for every Cargo
 target touched by the change. Destination-path configuration and rule interests
 are recomputed. Planning ends only when no enabled findings remain.
 
 A virtual state hash covers every path, file byte string, file mode, manifest
 model, and effective rule policy. Repeating a hash is a cycle. More than eight
-passes is a `non-converging-fix` error; eight permits every priority to expose a
-later rule and still leaves three guard passes beyond the expected maximum.
+passes is a `non-converging-fix` error. This is a defensive limit, not a proof
+that arbitrary rule combinations converge.
 
 For example, extracting an inline test can expose three later changes:
 
@@ -504,89 +548,62 @@ independent build command.
 
 ### Validation and recoverable writes
 
-The transaction state sequence is snapshot, plan, lock, preflight journal,
-preflight, extend journal, replace, validate, then commit or restore. It
-guarantees recovery and exact rollback of Stylon's source changes. It does not
-pretend that several filesystem renames become one atomic operation visible to
-unrelated readers.
+Use one transaction journal and one project lock. The state sequence is:
 
-Stylon acquires an exclusive create-only lock under the analysis root before
-preflight. The lock records the process ID, process start token, root, and
-transaction ID. Another live owner causes a `project-locked` error. A dead owner
-is stale only after its journal is recovered; Stylon never removes a stale lock
-without examining recovery state.
+```text
+plan -> lock and recheck inputs -> preflight journal -> baseline validation
+     -> extend journal -> replace -> validate -> commit or restore
+```
 
-The lock coordinates Stylon processes, not arbitrary editors. Stylon hashes the
-selected and structural-closure inputs after locking, before each replacement,
-and before validation. A third-state change aborts and restores only paths still
-matching Stylon's recorded replacement hash.
+The validator must leave project inputs unchanged; generated build output is
+outside this contract. Before baseline validation, retain a durable inventory
+of selected files, context inputs, manifests, configuration, and lockfiles so
+an interrupted or misbehaving validator cannot silently change those inputs.
+This inventory is the preflight phase of the same journal, not a second
+transaction system. A failing baseline stops all source edits. Lockfile creation
+or mutation by validation is a failure and is reported with recovery data.
+Projects without a lockfile must prepare validation separately before fixing.
 
-`--fix` runs the configured validation command before writing. A failing
-baseline stops immediately because Stylon could not attribute a later failure
-to its edits.
+The lock coordinates Stylon processes. Recheck hashes of all analysis inputs
+under the lock and immediately before replacement; an editor changing those
+inputs invalidates the plan. The user must not edit the project during a fix.
+Preserve dirty and untracked input bytes; never use Git reset. Validators must
+not modify project inputs or detach child processes.
 
-Before each validation, Stylon inventories and hashes selected Rust files,
-manifests, `stylon.toml`, `Cargo.lock`, and the structural closure. Changes to
-those inputs made by validation are validation failures. Stylon restores them,
-including deleting a `Cargo.lock` created when none existed. Build output and
-other ignored paths are outside the inventory. A custom validation command is
-contractually required not to mutate other project inputs.
+Before writes, durably record each affected path's original bytes or absence,
+mode, replacement hash or absence, and any created directories. Record intent
+before each rename and completion afterward, so recovery also handles a crash
+between those events. Flush backup data and journal intent before replacement,
+and flush target directories before recording completion. Each replacement uses
+an atomic rename on the target filesystem. Multi-file visibility is not atomic.
+Keep recovery files private to the current user and originals until commit.
 
-The original inventory and recovery bytes are flushed into a preflight-phase
-journal before baseline validation starts. If preflight fails normally, Stylon
-restores any monitored side effects and removes the journal before returning.
-If Stylon or the machine dies, startup recovery recognizes the preflight phase,
-terminates any surviving owned validator, restores the inventory, and removes
-the journal. A failed preflight therefore leaves no journal after recovery, not
-because no journal ever existed.
+Post-fix validation success durably marks the transaction committed before
+cleanup. Failure or interruption restores originals after terminating the
+validator's process group (Unix) or Job Object (Windows). Allow five seconds for
+graceful termination, then force termination. Startup recovery must verify an
+owned validator is stopped before touching files; if ownership or termination
+cannot be established, stop with recovery instructions.
 
-After a clean preflight, Stylon extends the durable journal with each affected
-regular file and directory, mode, original hash or absence, replacement hash or
-absence, and recovery location. Original bytes are retained until the
-transaction completes. Hard links and symlinks were rejected during discovery;
-ownership, ACLs, extended attributes, and timestamps are outside the
-preservation contract. File contents, executable mode, names, directory
-existence, and original absence are preserved.
+Startup recovery acquires the lock and inspects unfinished journal entries,
+including incomplete renames. Restore paths only when they still match a known
+original or replacement state. An unknown third state is never overwritten;
+report the path and retained backup for manual recovery. This also applies to
+unexpected validator mutations: do not claim to distinguish those from editor
+changes. A committed journal requires cleanup only. Check mode detecting an
+unfinished transaction exits `2` with instructions to run `--fix` for recovery;
+it never changes source files automatically.
 
-Recovery files are private to the current user, collision-resistant, and placed
-on the same filesystem as their targets. Journal data, recovery data, replaced
-files, and parent directories are flushed in that order. Individual
-same-filesystem renames are atomic, but another process can briefly observe a
-partially replaced multi-file tree. The project lock tells cooperating tools not
-to read during that interval.
+The preservation contract covers bytes, executable modes, filenames, created
+directories, and original absence. Symlinks and hard links are rejected;
+ownership, ACLs, extended attributes, and timestamps are outside the contract.
+Fault-injection tests must cover every durable state transition before release.
 
-The validation command then runs again. Success removes recovery data and the
-journal. Failure, interruption, or child-process termination restores original
-bytes, modes, names, and absence of newly created files before Stylon exits.
-
-Each validation command runs as a new Unix process group or Windows Job Object
-owned by the transaction. On interruption or failure, Stylon sends graceful
-termination to the whole group, waits up to five seconds, force-terminates the
-remaining group, and reaps it completely before restoring a single path. A
-configured validator must not detach or daemonize outside that ownership
-boundary; doing so voids validation safety and is reported when detectable.
-
-The journal records completion after every rename. On startup, Stylon detects an
-unfinished journal before scanning and replays completed steps in reverse,
-including partially created directories. It restores automatically when every
-target still matches either the recorded original or replacement hash. If
-another process changed a target to a third state, Stylon does not overwrite it
-and reports exact manual recovery paths. `SIGINT` and `SIGTERM` trigger the same
-in-process rollback; `SIGKILL` or power loss relies on startup recovery.
-
-The transaction never uses Git reset or assumes a clean working tree. Existing
-user changes are preserved byte for byte. The project must not be edited
-concurrently while `--fix` owns its project lock.
-
-The semantic guarantee is relative to the configured validation command. The
-default is comprehensive for host targets and all features, but cannot validate
-other operating-system targets. Replacing it is an explicit project decision;
-Stylon guarantees parsing, a clean fixed point, transaction safety, and success
-of that command, not correctness the command does not exercise.
-
-The five-second performance requirement ends after fix planning. Preflight and
-post-fix validation durations are displayed separately and may take as long as
-the configured command requires.
+Validation proves only that the configured command succeeds. `cargo check` does
+not run tests or prove runtime behavior, macro equivalence, or correctness on
+other targets. Projects needing those guarantees configure a command covering
+them. Baseline validation, disk writes, durability operations, and post-fix
+validation are outside the five-second scan/planning budget and timed separately.
 
 ## Rule Semantics
 
@@ -596,13 +613,21 @@ duplicating edits.
 
 ### Path qualification
 
-The path rules inspect syntax position first and consult the project index where
-identity is available. Rust permits unconventional identifier case, but Stylon's
-syntax-only third-party policy treats an uppercase-leading segment in a type,
-constructor, pattern, or associated-call position as a type. This naming-policy
-assumption is what lets Stylon normalize third-party enum and type paths without
-loading dependency APIs. A path that remains ambiguous under these syntax and
-case rules is an analysis error rather than a finding.
+Path rules inspect syntax position and consult the project index when identity
+is needed. Capitalization is not proof that a segment is a type, enum, or module.
+An explicit type position can establish that a full path denotes a type;
+expression/pattern/associated-call classification requires a known declaration.
+Unresolved third-party paths in those positions are analysis errors only when
+classification is necessary to decide or construct an enabled fix. Preserve the
+strict error policy rather than reporting speculative machine-applicable fixes.
+
+The resolver supports explicit lexical bindings, imports, workspace declarations,
+and known standard-library entries. It tracks type/value/macro namespaces and
+local shadowing. Glob expansion is allowed only for a completely known export
+set; traits imported solely for method lookup must not be dropped. Unknown macro
+expansion, procedural attributes, or third-party exports may prevent proof. A
+successful `cargo check` cannot substitute for binding identity: changed code can
+compile while selecting a different function or trait implementation.
 
 A **qualifier** is a named path segment before the final called function or
 variant, excluding a leading `::`. Exempt roots bypass the count completely.
@@ -664,7 +689,9 @@ import in the same file module, not every type in the workspace. For example,
 `crate::ui::alpha::Card` and `crate::game::beta::Card` become the shown paths
 after importing `crate::ui::alpha` and `crate::game::beta` as modules. Nested
 generic arguments, struct patterns, tuple constructors, and qualified aliases
-use the same type-path operation.
+use the same type-path operation. Check every affected lexical scope for generic
+parameters, local bindings, and existing imports that would shadow the new name;
+retain a distinguishing qualifier or fail planning if identity cannot be preserved.
 
 All three path rules exempt paths rooted in `std`, `core`, `alloc`, or
 `proc_macro`, including imported aliases of those modules. Paths rooted in
@@ -699,14 +726,16 @@ use crate::cards::shuffle;  // removed
 shuffle(&mut deck);         // becomes `cards::shuffle(&mut deck)`
 ```
 
-Restricted and private functions are outside this rule. Visibility-preserving
-`pub use` and `pub(crate) use` declarations generated at a module boundary are
-re-exports and are exempt. Glob imports from a known project module are
+Restricted and private functions are outside this rule. All re-export declarations (`pub use` and `pub(...) use`) are exempt;
+rewriting a public API is outside this rule. Glob imports from a known project module are
 expanded when they would otherwise import a public function; referenced types,
 traits, constants, and macros remain imported explicitly.
 
-For a renamed function import, the alias is removed and every resolved call is
-rewritten through the selected module. A glob is fixable only when each
+For a renamed function import, the alias is removed and every resolved value
+reference is rewritten through the selected module, including function pointers,
+callback arguments, and calls. Block-local shadowing must be distinguished from
+the imported binding. An import referenced inside opaque macro tokens cannot be
+safely removed or renamed; report an analysis error for that proposed fix. A glob is fixable only when each
 unqualified reference has exactly one declaration among local items, explicit
 imports, known glob exports, and the prelude. Ambiguity is an analysis error
 before any glob finding is emitted.
@@ -795,76 +824,7 @@ Ordinary URLs, reference labels that do not look like Rust paths, primitives,
 function links, macro links, and links inside arbitrary macro tokens are outside
 this rule.
 
-### `modules.root-layout`
 
-Every `lib.rs` and `mod.rs`, including a nested module's `mod.rs`, may contain
-crate/module inner attributes, inner documentation, external module
-declarations, and use or re-export declarations. Inline modules and every other
-ordinary item must move to an external file.
-
-Inline modules are extracted directly to external modules while preserving
-their names, visibility, attributes, and public paths. Remaining ordinary items
-move together to one private, collision-free module named from
-`implementation`, adding a numeric suffix only when necessary.
-
-For `lib.rs`, the destination is sibling `implementation.rs`. For a nested
-`mod.rs`, it is `implementation.rs` inside that module directory. The search
-then tries `implementation_2.rs`, `implementation_3.rs`, and so on, comparing
-case-folded canonical paths. Stylon creates a directory only when extracting a
-submodule from a `name.rs` file; root extraction itself does not choose
-`implementation/mod.rs`.
-
-The original root receives explicit re-exports grouped by original visibility.
-Private root items gain only the minimum child-to-parent visibility required for
-a private parent import. This preserves which descendants can name the item
-without exposing formerly private APIs outside their original scope.
-
-```rust
-mod implementation;
-pub use implementation::{Card, draw};
-pub(crate) use implementation::DeckCache;
-use implementation::reset_cache;
-```
-
-The implementation file retains original item order and receives imports needed
-by moved code. Bare `pub` stays `pub`. Restricted visibility is translated to
-the same canonical visibility scope; a relative `pub(in path)` is first
-resolved, then re-rendered from the new module. A private item becomes
-`pub(super)` only when the parent must import its old binding. The parent import
-uses the original visibility, so descendants see exactly the old name and
-scope. Re-exports sort by visibility and original source order, and Rust's type,
-value, and macro namespaces are checked independently for collisions.
-
-```rust
-// Before, in lib.rs: `pub struct Card; fn reset() {}`
-// After, in implementation.rs:
-pub struct Card;
-pub(super) fn reset() {}
-// lib.rs contains `pub use implementation::Card; use implementation::reset;`
-```
-
-Item attributes and relevant `cfg` conditions are copied to matching
-re-exports. Imports needed by moved code move with it. References from sibling
-modules are rewritten through the preserved root binding or the shortest valid
-module path.
-
-Procedural-macro crates have a required exception. Functions bearing
-`#[proc_macro]`, `#[proc_macro_attribute]`, or `#[proc_macro_derive]` may remain
-in a proc-macro crate's `lib.rs`; their helpers must still move. Crate-level
-attributes are also retained. No other crate kind receives this exception.
-
-Macro definitions move with the implementation while retaining relative order.
-`#[macro_export]` continues to export at the crate root. A non-exported macro
-that must remain visible through the old root receives the narrowest valid macro
-re-export. Post-fix Cargo validation is authoritative for macro scoping that
-syntax-only analysis cannot prove.
-
-`macro_rules!` declarations are known macro definitions for extraction but are
-opaque ordering barriers unless listed as constant-defining. Their bodies are
-never rewritten. Literal relative paths in moved attributes and include macros
-are recalculated to keep the same canonical target. Compatibility covers Rust
-and Cargo paths plus validated compilation; arbitrary tools that depend on
-physical source filenames are outside the contract.
 
 ### Test layout
 
@@ -888,11 +848,12 @@ is `foo/foo_tests.rs`; and for a crate root it is sibling
 mod tests;
 ```
 
-The path string is always relative to the declaring file under Rust's path
-attribute rules. Multiple conditional inline `mod tests` declarations are
-merged only when their conditions are disjoint and their combined external
-module parses; an existing external declaration or destination is otherwise a
-planning conflict.
+Compute the path using Rust's module-directory and `#[path]` rules, including
+inline ancestors. Preserve the original declaration's attributes and condition;
+the example assumes the original was `#[cfg(test)]`. Do not add `cfg(test)` to
+an unconditional module. Keep conditional declarations separate in uniquely
+named `_tests.rs` files rather than merging bodies with potentially duplicate
+items. An existing destination is a planning conflict.
 
 Nested modules and their visibility remain unchanged. Imports are re-evaluated
 after extraction, so `use super::*` is replaced through the ordinary import
@@ -900,7 +861,10 @@ rules rather than copied as a permanent exception.
 
 #### `tests.file-suffix`
 
-A Rust file containing a test function must end in `_tests.rs`. A test function
+A Rust file directly containing a test function must end in `_tests.rs`.
+Functions inside an inline module belong to that module for this rule; they do
+not also force a rename of the enclosing production file. Inline `tests`
+extraction is handled by the separate rule, avoiding rename/extraction cycles. A test function
 is one bearing built-in `#[test]`, an attribute whose final path segment is
 `test`, or a configured recognized test attribute. Stylon also recognizes the
 common `rstest` and `test_case` attributes. Doctests and macro-generated tests
@@ -924,11 +888,20 @@ an explicit `[[test]]` entry pointing to the new `_tests.rs` path. Existing
 scripts using `cargo test --test old_name` therefore continue to work. A target
 or destination collision is a pre-write planning error.
 
+Snapshot the complete target inventory and verify that the explicit path/name
+entry preserves it after the move, including `harness` and `required-features`.
+A Cargo 1.98.1 probe confirms that an explicit target path suppresses a duplicate
+auto-discovered target for that file; retain this regression fixture. Keep
+`autotests` unchanged. Target names and paths follow [Cargo's rules][cargo-targets].
+
 Special Cargo entry files are not renamed. If `lib.rs`, `main.rs`, `build.rs`, a
 `src/bin` root, example root, or benchmark root directly contains test
 functions, Stylon moves those functions into a sibling external module ending
-in `_tests.rs` and leaves a conditional module declaration. Referenced private
-helpers remain reachable through absolute crate/module paths. An ordinary
+in `_tests.rs` only when their condition implies `test` and all references can
+be preserved. Retain imports needed for trait lookup and original attributes.
+A test-like framework attribute alone does not justify hiding a function behind
+`cfg(test)`; uncertain cases are analysis errors. Referenced private helpers
+remain reachable through absolute crate/module paths. An ordinary
 module file is renamed and its parent receives a literal `#[path]` preserving
 the original module name.
 
@@ -1117,8 +1090,9 @@ The release binary must satisfy all of these conditions:
 - No persistent Stylon cache exists between or within the runs; every selected
   file is parsed and indexed each time.
 - `--fix` scanning and in-memory planning obey the same 5.0-second boundary on
-  an already compliant disposable corpus. Cargo preflight and post-fix
-  validation are excluded and reported separately.
+  the original corpus with violations, including all virtual passes and the
+  final clean scan. An already compliant corpus is a separate no-op benchmark.
+  Validation and filesystem writes are excluded and reported separately.
 - Human output is redirected during timing so terminal rendering is not the
   bottleneck. A separate JSON benchmark confirms serialization remains inside
   the same budget.
@@ -1132,12 +1106,40 @@ analysis state. The nearest-rank p95 is the 19th value after sorting 20 wall
 times. Process startup, configuration, discovery, Cargo metadata, parsing,
 planning, sorting, and serialization are inside the measured interval.
 
-The fix-planning benchmark uses the disposable Battlement tree produced and
-validated by the end-to-end fix test, so it is reproducibly compliant. Its
-validation command is replaced by a recorded successful no-op only for timing;
-the separate end-to-end test uses
-`cargo check --workspace --all-targets --all-features --locked` when the pinned
-workspace supports it.
+The fix-planning benchmark invokes the production in-memory planner on a fresh
+snapshot of the original corpus for each run. No no-op validator is necessary:
+the timed interval ends before lock acquisition and validation. A planning error
+or non-convergence fails acceptance, even if fast. The separate end-to-end fix
+test performs actual writes and runs the real configured validator. If Battlement
+needs exclusions or another validation command, document and review that
+configuration explicitly; a corpus that exits `2` is not a passing release run.
+
+### Feasibility evidence
+
+A local component probe on the reference M5 Max (Mac17,6, 18 cores, 64 GiB),
+macOS 26.5.2 (25F84), Rust/Cargo 1.98.1, measured the following with three warm-ups
+and 20 fresh-process runs:
+
+| Component | Work | Median | p95 |
+| --- | --- | --- | --- |
+| Read, parse, walk syntax | 480 files, 4,293,719 bytes, 1,013,539 nodes | 0.023 s | 0.026 s |
+| Cargo metadata | Seven workspace/package invocations, sequential | 0.121 s | 0.132 s |
+
+All source files parsed without errors. These component costs make a five-second
+scan plausible with substantial headroom. They are not an end-to-end measurement:
+the probe excludes Git-aware traversal of the real checkout, retained project
+facts, name resolution, rules, diagnostics, and iterative planning. Separate
+component p95 values must not be presented as a measured total. Other desktop
+activity was not controlled. See [raw results](benchmarks/readiness/results.json)
+and the [reproducible probe](benchmarks/readiness/run.py), with its locked parser
+dependencies, for exact samples and limitations.
+
+Five seconds is verified only when the full acceptance run passes. LOC alone
+cannot bound arbitrary Rust workloads: record source bytes, file count, findings,
+and metadata invocation count as well. Cold filesystem caches and projects with
+far more independent workspaces are outside this reference-corpus guarantee.
+The original clean-tree fix benchmark offered no evidence for dirty-tree planning;
+that remains the main unmeasured performance goal.
 
 The implementation must preserve the following performance properties:
 
@@ -1148,7 +1150,9 @@ The implementation must preserve the following performance properties:
 - rules declare interests so irrelevant files and facts are skipped;
 - dependency source, compiler metadata, macro expansion, and type inference are
   never loaded; and
-- output is sorted once after parallel evaluation.
+- output is sorted once after parallel evaluation; and
+- name/export lookups use indexed maps with cycle detection, avoiding repeated
+  full-workspace searches or enumeration of every `cfg` combination.
 
 Phase timing is part of every benchmark artifact. A regression is investigated
 at the responsible phase rather than relaxing the five-second total.
@@ -1164,13 +1168,14 @@ The pre-implementation audit used lexical and structural searches rather than
 Stylon's future parser. Counts are therefore candidate lower or upper bounds,
 not promised diagnostic totals:
 
-- 469 tracked Rust files contain 138,483 lines.
+- A fresh tracked-file count found 480 Rust files and 141,784 lines. The earlier
+  469-file / 138,483-line count is superseded; rule candidate counts below remain
+  historical estimates requiring a fresh scanner audit.
 - Approximately 1,138 non-standard multi-segment path occurrences are
   candidates for qualification checks.
 - `crates/battlement-fake/src/client/ui.rs` alone has 205 qualified type or
   variant candidates; another Reactant test has 53.
 - 29 imports begin with `self::` or `super::`.
-- At least 23 `lib.rs` or `mod.rs` files contain top-level ordinary code.
 - 19 production/source files contain top-level inline `mod tests` modules.
 - Approximately 95 files with test attributes do not end in `_tests.rs`.
 - 12 external dependencies in actual workspace members do not inherit from the
@@ -1183,7 +1188,6 @@ not promised diagnostic totals:
 
 These concentrations influenced the design directly:
 
-- Root extraction must preserve APIs and exempt proc-macro entry points.
 - Test fixes must preserve Cargo target names and module paths rather than only
   renaming files.
 - Ordering must stop at unknown macro barriers because Battlement contains many
@@ -1218,15 +1222,14 @@ Cross-rule fixtures cover shared and conflicting edits, including:
 - type and variant findings that need the same import;
 - hoisted imports followed by direct-function rewriting;
 - test extraction followed by absolute crate import rewriting;
-- module extraction followed by item ordering and Rustdoc resolution;
+- inline-module extraction followed by item ordering and Rustdoc resolution;
 - path collisions requiring shortest unique qualification; and
 - comments and `cfg` attributes moving with their items.
 
 Black-box Cargo fixtures validate compile-sensitive behavior:
 
-- library root extraction preserves public, restricted, and private access;
-- exported and private `macro_rules!` definitions retain required scope;
-- proc-macro entry points remain at the crate root while helpers move;
+- ordinary library/root items remain in place unless another enabled rule applies;
+- inline-module extraction preserves relative paths and macro scope;
 - explicit and auto-discovered integration tests retain their old target names;
 - alternative `cfg` declarations agree or produce a planning error;
 - workspace dependency promotion preserves features and optionality; and
@@ -1234,8 +1237,9 @@ Black-box Cargo fixtures validate compile-sensitive behavior:
 
 Transaction tests hash every source before and after forced preflight failure,
 post-fix failure, interrupt, simulated process death, and recovery. They verify
-that modes, names, contents, user changes, and absent files are restored
-exactly. A concurrent third-state edit must block automatic recovery.
+that known states restore modes, names, contents, and original absence exactly.
+A concurrent or validator-created third state must block automatic recovery
+and retain backups rather than overwrite unknown changes.
 
 The pinned Battlement test runs against a disposable copy:
 
@@ -1251,75 +1255,20 @@ upgrade is not accepted solely because Stylon compiles.
 
 ## Manual QA
 
-Manual QA uses a disposable copy of pinned Battlement plus small purpose-built
-Cargo workspaces. Never point destructive failure scenarios at the developer's
-only checkout.
+Use disposable pinned Battlement and focused Cargo fixtures. Automated fixtures
+cover rule permutations; manual QA concentrates on the user-visible workflow:
 
-- Run `stylon` at the Battlement root. Confirm compiler-style paths are
-  relative, rule IDs are present, the observed concentrations match the
-  approved audit, and ignored Unity and worktree trees are absent.
-- Repeat with one explicit file, one directory, an untracked file, and a
-  non-Git fixture. Confirm only selected files receive findings while required
-  manifests and parent modules are context. Confirm an explicitly named ignored
-  file is scanned and a configured exclusion still wins.
-- Exercise ancestor discovery, `--config`, nested configs, invalid versions,
-  unknown keys, invalid globs, and two matching overrides. Confirm the last
-  override wins only in the valid case and every invalid case exits `2`.
-- Run with `--format json`, validate schema version 1, and compare finding order
-  with human output. Repeat the command and confirm byte-identical JSON after
-  removing timing fields.
-- Trigger exits `0`, `1`, and `2` in both formats. Confirm UTF-8 half-open byte
-  ranges, Unicode-scalar columns, sorted errors, empty JSON-mode standard error,
-  captured validation output, and timing output without private paths.
-- Add a root `stylon.toml` that disables only `tests.file-suffix` under one
-  crate. Confirm inline-test findings remain there, filename findings disappear
-  only under the matching path, and deleting the config restores defaults.
-- Add `// stylon-ignore` and `#[allow(stylon)]` beside a violation. Confirm the
-  finding remains and no special suppression behavior appears.
-- In a disposable clean Battlement copy, run `stylon --fix`. Inspect the
-  generated implementation modules, visibility-matched re-exports, extracted
-  test modules, preserved Cargo test names, promoted dependencies, and moved
-  comments. Confirm both Cargo validations pass.
-- Run check mode and fix mode again. Confirm zero findings and no changed bytes.
-- Configure a validation command that exits unsuccessfully after the preflight
-  succeeds. Confirm Stylon restores the exact original hashes, modes, names,
-  and untracked-file state.
-- Fail the initial preflight and confirm no journal or source edit appears. Run
-  two Stylon fixers concurrently and confirm lock contention. Modify an input
-  from an editor after planning and confirm the hash check aborts safely.
-- Use a validator that spawns a long-running child, then interrupt Stylon.
-  Confirm the complete process group is gone before file restoration begins and
-  no descendant rewrites a restored path.
-- Terminate Stylon after writes but before validation finishes. Restart it and
-  confirm automatic recovery. Then repeat while manually changing one affected
-  file and confirm recovery stops without overwriting that third state.
-- Interrupt after each individual rename in a multi-file transaction and while
-  creating directories. Confirm reverse replay handles every partial state.
-  Make validation create or modify `Cargo.lock` and confirm original lockfile
-  presence and bytes are restored as specified.
-- Create two member manifests with incompatible specifications for one external
-  dependency. Confirm Stylon reports both paths, exits `2`, and writes nothing.
-- Create a proc-macro fixture with helpers in `lib.rs`. Confirm only the three
-  permitted proc-macro entry-point forms remain at the root and the resulting
-  crate compiles.
-- Create same-named types in two modules. Confirm the fixer uses the shortest
-  unique qualification and does not generate aliases.
-- Exercise free and associated calls, enum patterns, nested generic types,
-  renamed and glob function imports, standard-library module aliases, nested
-  `super` imports, conflicting function-local imports, and an ambiguous
-  third-party path. Confirm intended fixes and the required analysis error.
-- Exercise shortcut, labelled, qualified, backticked, disambiguated, generic,
-  primitive, and unresolved Rustdoc links. Confirm only unresolved type links
-  lose navigation and custom display text remains readable.
-- Exercise item ordering with fixed imports, restricted visibility, comments,
-  compound test conditions, known constant macros, opaque barriers, CRLF, and
-  missing blank lines. Confirm stable order and exact trivia ownership.
-- Exercise dependency ordering separately from inheritance. Confirm path-first
-  grouping, exact compatibility checks, member-only features, existing catalog
-  conflicts, renamed packages, and untouched dev/build/target tables.
-- Apply test suffix fixes to ordinary modules, integration tests, `lib.rs`,
-  `main.rs`, examples, benchmarks, and build scripts. Confirm Cargo target and
-  Rust module names stay stable and every generated path is relative correctly.
-- Run the release benchmark for 20 measured Battlement scans on the reference
-  Mac. Confirm p95 is at most 5.0 seconds and inspect phase timings for any run
-  approaching the limit.
+- Check the root, one file, a directory, an untracked file, and a non-Git fixture.
+  Confirm ignore/exclusion behavior, context boundaries, and relative diagnostics.
+- Exercise configuration errors, directory overrides, ignored source annotations,
+  all exit codes, deterministic human/JSON output, and timing output.
+- Fix a dirty corpus, inspect the diff, run project validation, then require a
+  clean scan and a second fix with no filesystem changes. Check test target
+  inventory, comments, imports, and dependency feature settings specifically.
+- Force baseline and post-fix failures. Interrupt during validation and each
+  filesystem transition, then restart. Confirm child termination, journal
+  recovery, original absence/modes, and preservation of user changes.
+- Run two fixers, edit an input after planning, and introduce a third-state
+  change during recovery. Confirm clear errors and retained manual recovery data.
+- Run the release benchmarks on the reference machine and inspect phase timings.
+  A parser microbenchmark alone is not release acceptance.
