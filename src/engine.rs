@@ -203,23 +203,123 @@ pub(crate) fn run(cli: &Cli) -> ExitCode {
             &creations,
             &file_suffix.deletions,
         ) {
-            Ok(changes) => {
-                let inventory = inventory(&config, &parsed);
-                match transaction::apply(&config, &changes, &inventory) {
-                    Ok(()) => {
-                        for diagnostic in &mut diagnostics {
-                            diagnostic.applied = true;
+            Ok(changes) => match verify_plan(&config, &parsed, &changes) {
+                Ok(()) => {
+                    let inventory = inventory(&config, &parsed);
+                    match transaction::apply(&config, &changes, &inventory) {
+                        Ok(()) => {
+                            for diagnostic in &mut diagnostics {
+                                diagnostic.applied = true;
+                            }
+                            summary.fixed = diagnostics.len();
                         }
-                        summary.fixed = diagnostics.len();
+                        Err(error) => errors.push(error),
                     }
-                    Err(error) => errors.push(error),
                 }
-            }
+                Err(error) => errors.push(error),
+            },
             Err(error) => errors.push(error),
         }
     }
 
     finish(cli, diagnostics, errors, summary)
+}
+
+fn verify_plan(
+    config: &Config,
+    parsed: &[ParsedFile],
+    changes: &[Change],
+) -> Result<(), OperationalError> {
+    let mut files: std::collections::BTreeMap<_, _> = parsed
+        .iter()
+        .map(|file| (file.path.clone(), file.source.clone()))
+        .collect();
+    for change in changes {
+        if let Some(replacement) = &change.replacement {
+            let source = String::from_utf8(replacement.clone()).map_err(|_| OperationalError {
+                category: "planning",
+                message: format!(
+                    "planned replacement for {} is not UTF-8",
+                    config.relative(&change.path).display()
+                ),
+                paths: vec![config.relative(&change.path)],
+            })?;
+            files.insert(change.path.clone(), source);
+        } else {
+            files.remove(&change.path);
+        }
+    }
+
+    let mut diagnostics = Vec::new();
+    let mut errors = Vec::new();
+    for (path, source) in &files {
+        let relative = config.relative(path);
+        if path.extension() == Some(OsStr::new("rs")) {
+            ensure_parseable(&relative, source)?;
+            diagnostics.extend(
+                rules::check(config, &relative, source)
+                    .into_iter()
+                    .map(|finding| finding.diagnostic),
+            );
+        } else if path.file_name() == Some(OsStr::new("Cargo.toml")) {
+            diagnostics.extend(
+                rules::check_manifest(config, &relative, source)
+                    .into_iter()
+                    .map(|finding| finding.diagnostic),
+            );
+        }
+    }
+    let manifest_inputs: Vec<_> = files
+        .iter()
+        .filter(|(path, _)| path.file_name() == Some(OsStr::new("Cargo.toml")))
+        .map(|(path, source)| ManifestInput {
+            path,
+            relative: config.relative(path),
+            source,
+        })
+        .collect();
+    let workspace = cargo_rules::analyze_workspace(config, &manifest_inputs);
+    diagnostics.extend(workspace.diagnostics);
+    errors.extend(workspace.errors);
+    let rust_inputs: Vec<_> = files
+        .iter()
+        .filter(|(path, _)| path.extension() == Some(OsStr::new("rs")))
+        .map(|(path, source)| RustInput {
+            path,
+            relative: config.relative(path),
+            source,
+        })
+        .collect();
+    let inline_tests = crate::tests_layout::analyze_inline_tests(config, &rust_inputs);
+    diagnostics.extend(inline_tests.diagnostics);
+    errors.extend(inline_tests.errors);
+    let manifests = manifest_inputs
+        .iter()
+        .map(|input| (input.path.to_path_buf(), input.source.to_owned()))
+        .collect();
+    let file_suffix = crate::tests_layout::analyze_file_suffix(config, &rust_inputs, &manifests);
+    diagnostics.extend(file_suffix.diagnostics);
+    errors.extend(file_suffix.errors);
+    let public_functions = crate::imports::analyze_public_functions(config, &rust_inputs);
+    diagnostics.extend(public_functions.diagnostics);
+
+    if errors.is_empty() && diagnostics.is_empty() {
+        Ok(())
+    } else {
+        let mut paths: Vec<_> = diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.path)
+            .chain(errors.into_iter().flat_map(|error| error.paths))
+            .collect();
+        paths.sort();
+        paths.dedup();
+        Err(OperationalError {
+            category: "non-converging-fix",
+            message: "the complete virtual fix still contains enabled findings or analysis errors"
+                .to_owned(),
+            paths,
+        })
+    }
 }
 
 #[derive(Debug)]
