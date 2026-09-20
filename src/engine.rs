@@ -8,6 +8,7 @@ use std::time::Instant;
 use ra_ap_syntax::{Edition, SourceFile};
 use rayon::prelude::*;
 
+use crate::cargo_rules::{self, ManifestInput};
 use crate::cli::{Cli, OutputFormat};
 use crate::config::Config;
 use crate::diagnostic::{Diagnostic, JsonOutput, OperationalError, Summary, Timings};
@@ -76,12 +77,24 @@ pub(crate) fn run(cli: &Cli) -> ExitCode {
             findings.into_iter().map(|finding| finding.diagnostic)
         })
         .collect();
+    let manifest_inputs: Vec<_> = parsed
+        .iter()
+        .filter(|file| file.path.file_name() == Some(OsStr::new("Cargo.toml")))
+        .map(|file| ManifestInput {
+            path: &file.path,
+            relative: config.relative(&file.path),
+            source: &file.source,
+        })
+        .collect();
+    let workspace = cargo_rules::analyze_workspace(&config, &manifest_inputs);
+    diagnostics.extend(workspace.diagnostics);
+    errors.extend(workspace.errors);
     if let Some(timings) = &mut summary.timings {
         timings.rule_evaluation_ms = milliseconds(evaluation_started.elapsed());
     }
 
     if cli.fix && errors.is_empty() && !diagnostics.is_empty() {
-        match plan_changes(&config, &parsed) {
+        match plan_changes(&config, &parsed, &workspace.replacements) {
             Ok(changes) => {
                 let inventory = inventory(&config, &parsed);
                 match transaction::apply(&config, &changes, &inventory) {
@@ -108,15 +121,22 @@ struct ParsedFile {
     syntax_nodes: usize,
 }
 
-fn plan_changes(config: &Config, parsed: &[ParsedFile]) -> Result<Vec<Change>, OperationalError> {
+fn plan_changes(
+    config: &Config,
+    parsed: &[ParsedFile],
+    workspace_replacements: &std::collections::BTreeMap<PathBuf, String>,
+) -> Result<Vec<Change>, OperationalError> {
     parsed
         .iter()
         .filter_map(|file| {
             let relative = config.relative(&file.path);
+            let initial = workspace_replacements
+                .get(&file.path)
+                .map_or(file.source.as_str(), String::as_str);
             let fixed = if file.path.extension() == Some(OsStr::new("rs")) {
-                fixed_source(config, &relative, &file.source)
+                fixed_source(config, &relative, initial)
             } else {
-                fixed_manifest(config, &relative, &file.source)
+                fixed_manifest(config, &relative, initial)
             };
             match fixed {
                 Ok(replacement) if replacement != file.source => {
