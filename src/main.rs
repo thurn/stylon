@@ -1,3 +1,5 @@
-fn main() {
-    println!("stylon {}", env!("CARGO_PKG_VERSION"));
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    stylon::run(std::env::args_os())
 }

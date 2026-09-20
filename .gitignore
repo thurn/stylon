@@ -1,1 +1,3 @@
 /target/
+.stylon.lock
+.stylon-transaction/

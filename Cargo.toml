@@ -10,6 +10,27 @@ repository = "https://github.com/thurn/stylon"
 [lints.rust]
 unsafe_code = "forbid"
 
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"
+
+[dependencies]
+clap = { version = "4.5.48", features = ["derive"] }
+fs2 = "0.4.3"
+globset = "0.4.16"
+ignore = "0.4.23"
+ra_ap_syntax = "=0.0.350"
+rayon = "1.11.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+thiserror = "2.0.16"
+toml = "0.9.7"
+
+[dev-dependencies]
+tempfile = "3.23.0"
+
 [[bin]]
 name = "stylon"
 path = "src/main.rs"

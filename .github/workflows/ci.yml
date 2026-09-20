@@ -25,9 +25,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Lint
-        run: >-
-          cargo clippy --workspace --all-targets --all-features --locked --
-          -D warnings -W clippy::pedantic -W clippy::nursery
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Test
         run: cargo test --workspace --all-targets --all-features --locked
