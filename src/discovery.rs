@@ -5,6 +5,8 @@ use ignore::{DirEntry, WalkBuilder};
 
 use crate::config::Config;
 use crate::diagnostic::OperationalError;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 pub(crate) fn discover(
     config: &Config,
@@ -103,7 +105,6 @@ fn selected_file(config: &Config, path: PathBuf) -> Result<Option<PathBuf>, Vec<
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
         if metadata.nlink() > 1 {
             return Err(vec![error(
                 "filesystem",

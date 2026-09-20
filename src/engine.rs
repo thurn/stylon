@@ -210,6 +210,8 @@ fn fixed_source(
         let before = source.clone();
         source = apply_qualification_edits(config, relative, source)?;
         ensure_parseable(relative, &source)?;
+        source = apply_rule_edits(config, relative, source, "imports.top-level")?;
+        ensure_parseable(relative, &source)?;
         source = apply_rule_edits(config, relative, source, "rustdoc.type-links")?;
         ensure_parseable(relative, &source)?;
         source = apply_rule_edits(config, relative, source, "items.order")?;

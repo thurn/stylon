@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::diagnostic::OperationalError;
 use std::fs::Permissions;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 const LOCK_FILE: &str = ".stylon.lock";
 const TRANSACTION_DIRECTORY: &str = ".stylon-transaction";
@@ -364,7 +366,6 @@ fn sync_directory(path: &Path) -> Result<(), OperationalError> {
 
 #[cfg(unix)]
 fn set_private_permissions(path: &Path) -> Result<(), OperationalError> {
-    use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, Permissions::from_mode(0o700)).map_err(|source| {
         error(
             "filesystem",

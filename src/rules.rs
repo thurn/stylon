@@ -45,6 +45,7 @@ pub(crate) fn check(config: &Config, relative: &Path, source: &str) -> Vec<Findi
         }
     }
     findings.extend(crate::qualification::check(config, relative, source));
+    findings.extend(crate::imports::check_top_level(config, relative, source));
     findings
 }
 
