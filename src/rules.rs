@@ -3,6 +3,7 @@ use std::path::Path;
 
 use ra_ap_syntax::ast::{self, AstNode, HasModuleItem, HasName, HasVisibility};
 use ra_ap_syntax::{Edition, SourceFile};
+use toml_edit::{DocumentMut, Item, Table};
 
 use crate::config::Config;
 use crate::diagnostic::Diagnostic;
@@ -37,6 +38,48 @@ pub(crate) fn check(config: &Config, relative: &Path, source: &str) -> Vec<Findi
         }
     }
     findings
+}
+
+pub(crate) fn check_manifest(config: &Config, relative: &Path, source: &str) -> Vec<Finding> {
+    if !config.rule_enabled("cargo.dependency-order", relative) {
+        return Vec::new();
+    }
+    let Ok(mut document) = source.parse::<DocumentMut>() else {
+        return Vec::new();
+    };
+    let mut first_misordered = None;
+    if let Some(table) = document
+        .get_mut("dependencies")
+        .and_then(Item::as_table_mut)
+    {
+        first_misordered = sort_dependency_table(table);
+    }
+    if let Some(table) = document
+        .get_mut("workspace")
+        .and_then(Item::as_table_mut)
+        .and_then(|workspace| workspace.get_mut("dependencies"))
+        .and_then(Item::as_table_mut)
+    {
+        let workspace_misordered = sort_dependency_table(table);
+        first_misordered = first_misordered.or(workspace_misordered);
+    }
+    let Some(range) = first_misordered else {
+        return Vec::new();
+    };
+    vec![Finding {
+        diagnostic: Diagnostic::new(
+            "cargo.dependency-order",
+            "path dependencies must come first and dependencies must be sorted by key",
+            relative.to_path_buf(),
+            source,
+            range.start,
+            range.end,
+        ),
+        edits: vec![Edit {
+            range: 0..source.len(),
+            replacement: document.to_string(),
+        }],
+    }]
 }
 
 struct RuleContext<'a> {
@@ -290,6 +333,39 @@ fn has_empty_line(separator: &str) -> bool {
         .any(|line| line.trim_matches([' ', '\t', '\r']).is_empty())
 }
 
+fn sort_dependency_table(table: &mut Table) -> Option<Range<usize>> {
+    let entries: Vec<_> = table
+        .iter()
+        .map(|(key, item)| (key.to_owned(), dependency_is_path(item)))
+        .collect();
+    let mut expected = entries.clone();
+    expected.sort_by(|left, right| (!left.1, &left.0).cmp(&(!right.1, &right.0)));
+    let misplaced_key = entries
+        .iter()
+        .zip(&expected)
+        .find(|(actual, expected)| actual != expected)
+        .map(|((key, _), _)| key);
+    let misplaced = misplaced_key
+        .and_then(|key| table.key(key))
+        .and_then(toml_edit::Key::span)
+        .or_else(|| misplaced_key.map(|_| 0..0));
+    if misplaced.is_some() {
+        table.sort_values_by(|left_key, left, right_key, right| {
+            (!dependency_is_path(left), left_key.get())
+                .cmp(&(!dependency_is_path(right), right_key.get()))
+        });
+    }
+    misplaced
+}
+
+fn dependency_is_path(item: &Item) -> bool {
+    item.as_inline_table()
+        .is_some_and(|table| table.contains_key("path"))
+        || item
+            .as_table()
+            .is_some_and(|table| table.contains_key("path"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -297,7 +373,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::check;
+    use super::{check, check_manifest};
     use crate::config::Config;
 
     fn config() -> (tempfile::TempDir, Config) {
@@ -335,6 +411,30 @@ mod tests {
                 .filter(|finding| finding.diagnostic.rule_id == "items.blank-lines")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn orders_path_and_external_dependencies_without_reformatting_values() {
+        let (_directory, config) = config();
+        let source = r#"[dependencies]
+# external comment
+serde = { version = "1", features = ["derive", "derive"] }
+# internal comment
+local = { path = "../local" }
+anyhow = "1"
+"#;
+        let findings = check_manifest(&config, Path::new("Cargo.toml"), source);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].edits[0].replacement,
+            r#"[dependencies]
+# internal comment
+local = { path = "../local" }
+anyhow = "1"
+# external comment
+serde = { version = "1", features = ["derive", "derive"] }
+"#
         );
     }
 }

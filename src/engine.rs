@@ -66,11 +66,14 @@ pub(crate) fn run(cli: &Cli) -> ExitCode {
     let evaluation_started = Instant::now();
     let mut diagnostics: Vec<_> = parsed
         .par_iter()
-        .filter(|file| file.path.extension() == Some(OsStr::new("rs")))
         .flat_map_iter(|file| {
-            rules::check(&config, &config.relative(&file.path), &file.source)
-                .into_iter()
-                .map(|finding| finding.diagnostic)
+            let relative = config.relative(&file.path);
+            let findings = if file.path.extension() == Some(OsStr::new("rs")) {
+                rules::check(&config, &relative, &file.source)
+            } else {
+                rules::check_manifest(&config, &relative, &file.source)
+            };
+            findings.into_iter().map(|finding| finding.diagnostic)
         })
         .collect();
     if let Some(timings) = &mut summary.timings {
@@ -108,10 +111,14 @@ struct ParsedFile {
 fn plan_changes(config: &Config, parsed: &[ParsedFile]) -> Result<Vec<Change>, OperationalError> {
     parsed
         .iter()
-        .filter(|file| file.path.extension() == Some(OsStr::new("rs")))
         .filter_map(|file| {
             let relative = config.relative(&file.path);
-            match fixed_source(config, &relative, &file.source) {
+            let fixed = if file.path.extension() == Some(OsStr::new("rs")) {
+                fixed_source(config, &relative, &file.source)
+            } else {
+                fixed_manifest(config, &relative, &file.source)
+            };
+            match fixed {
                 Ok(replacement) if replacement != file.source => {
                     let permissions = match fs::metadata(&file.path) {
                         Ok(metadata) => metadata.permissions(),
@@ -135,6 +142,32 @@ fn plan_changes(config: &Config, parsed: &[ParsedFile]) -> Result<Vec<Change>, O
             }
         })
         .collect()
+}
+
+fn fixed_manifest(
+    config: &Config,
+    relative: &std::path::Path,
+    source: &str,
+) -> Result<String, OperationalError> {
+    let findings = rules::check_manifest(config, relative, source);
+    let edits: Vec<_> = findings
+        .into_iter()
+        .flat_map(|finding| finding.edits)
+        .collect();
+    ensure_non_overlapping(relative, &edits)?;
+    let mut fixed = source.to_owned();
+    for edit in edits.into_iter().rev() {
+        fixed.replace_range(edit.range, &edit.replacement);
+    }
+    if rules::check_manifest(config, relative, &fixed).is_empty() {
+        Ok(fixed)
+    } else {
+        Err(OperationalError {
+            category: "planning",
+            message: format!("manifest fixes did not converge for {}", relative.display()),
+            paths: vec![relative.to_path_buf()],
+        })
+    }
 }
 
 fn fixed_source(
