@@ -12,16 +12,16 @@ use ra_ap_syntax::ast::Fn;
 use toml_edit::{DocumentMut, Item};
 
 #[derive(Debug, Default)]
-pub(crate) struct TestLayoutAnalysis {
-    pub(crate) diagnostics: Vec<Diagnostic>,
-    pub(crate) errors: Vec<OperationalError>,
-    pub(crate) replacements: BTreeMap<PathBuf, String>,
-    pub(crate) creations: BTreeMap<PathBuf, String>,
-    pub(crate) deletions: BTreeSet<PathBuf>,
-    pub(crate) moves: BTreeMap<PathBuf, PathBuf>,
+pub struct TestLayoutAnalysis {
+    pub diagnostics: Vec<Diagnostic>,
+    pub errors: Vec<OperationalError>,
+    pub replacements: BTreeMap<PathBuf, String>,
+    pub creations: BTreeMap<PathBuf, String>,
+    pub deletions: BTreeSet<PathBuf>,
+    pub moves: BTreeMap<PathBuf, PathBuf>,
 }
 
-pub(crate) fn analyze_file_suffix(
+pub fn analyze_file_suffix(
     config: &Config,
     inputs: &[RustInput<'_>],
     manifests: &BTreeMap<PathBuf, String>,
@@ -153,10 +153,7 @@ pub(crate) fn analyze_file_suffix(
     analysis
 }
 
-pub(crate) fn analyze_inline_tests(
-    config: &Config,
-    inputs: &[RustInput<'_>],
-) -> TestLayoutAnalysis {
+pub fn analyze_inline_tests(config: &Config, inputs: &[RustInput<'_>]) -> TestLayoutAnalysis {
     let mut analysis = TestLayoutAnalysis::default();
     for input in inputs {
         if !config.rule_enabled("tests.no-inline-module", &input.relative) {

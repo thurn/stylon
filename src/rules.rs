@@ -14,21 +14,26 @@ use ra_ap_syntax::SyntaxNode;
 use ra_ap_syntax::ast::Comment;
 use ra_ap_syntax::ast::Module;
 
-static RULES: [&dyn Rule; 3] = [&RustdocTypeLinks, &ItemOrder, &BlankLines];
+static RULES: [&dyn Rule; 4] = [
+    &RustdocTypeLinks,
+    &RestrictedVisibility,
+    &ItemOrder,
+    &BlankLines,
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Edit {
-    pub(crate) range: Range<usize>,
-    pub(crate) replacement: String,
+pub struct Edit {
+    pub range: Range<usize>,
+    pub replacement: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Finding {
-    pub(crate) diagnostic: Diagnostic,
-    pub(crate) edits: Vec<Edit>,
+pub struct Finding {
+    pub diagnostic: Diagnostic,
+    pub edits: Vec<Edit>,
 }
 
-pub(crate) fn check(config: &Config, relative: &Path, source: &str) -> Vec<Finding> {
+pub fn check(config: &Config, relative: &Path, source: &str) -> Vec<Finding> {
     let parsed = SourceFile::parse(source, Edition::Edition2024);
     debug_assert!(parsed.errors().is_empty());
     let context = RuleContext {
@@ -48,7 +53,7 @@ pub(crate) fn check(config: &Config, relative: &Path, source: &str) -> Vec<Findi
     findings
 }
 
-pub(crate) fn check_manifest(config: &Config, relative: &Path, source: &str) -> Vec<Finding> {
+pub fn check_manifest(config: &Config, relative: &Path, source: &str) -> Vec<Finding> {
     if !config.rule_enabled("cargo.dependency-order", relative) {
         return Vec::new();
     }
@@ -108,6 +113,8 @@ struct BlankLines;
 
 struct RustdocTypeLinks;
 
+struct RestrictedVisibility;
+
 struct KnownTypes {
     names: HashSet<String>,
     has_local_glob: bool,
@@ -141,6 +148,46 @@ impl Rule for RustdocTypeLinks {
             block.push(comment);
         }
         check_doc_block(context, &block, &known, findings);
+    }
+}
+
+impl Rule for RestrictedVisibility {
+    fn id(&self) -> &'static str {
+        "visibility.no-restricted"
+    }
+
+    fn check(&self, context: &RuleContext<'_>, findings: &mut Vec<Finding>) {
+        for visibility in context
+            .file
+            .syntax()
+            .descendants()
+            .filter_map(ast::Visibility::cast)
+        {
+            let spelling: String = visibility
+                .syntax()
+                .text()
+                .to_string()
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect();
+            if !matches!(spelling.as_str(), "pub(crate)" | "pub(super)") {
+                continue;
+            }
+
+            let range = text_range(visibility.syntax());
+            findings.push(Finding {
+                diagnostic: Diagnostic::new(
+                    "visibility.no-restricted",
+                    format!("restricted visibility `{spelling}` is prohibited"),
+                    context.relative.to_path_buf(),
+                    context.source,
+                    range.start,
+                    range.end,
+                )
+                .without_fix(),
+                edits: Vec::new(),
+            });
+        }
     }
 }
 

@@ -3,7 +3,7 @@ use std::fs;
 use tempfile::tempdir;
 
 use crate::config::Config;
-use crate::discovery::discover;
+use crate::discovery;
 
 #[test]
 fn rejects_nested_configuration_in_a_selected_directory() {
@@ -16,7 +16,8 @@ fn rejects_nested_configuration_in_a_selected_directory() {
     let config = Config::load(directory.path(), None).expect("configuration");
     let requested = fs::canonicalize(directory.path()).expect("requested path");
 
-    let errors = discover(&config, &requested).expect_err("nested configuration must fail");
+    let errors =
+        discovery::discover(&config, &requested).expect_err("nested configuration must fail");
 
     assert_eq!(errors[0].category, "configuration");
     assert_eq!(

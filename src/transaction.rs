@@ -16,14 +16,14 @@ const LOCK_FILE: &str = ".stylon.lock";
 const TRANSACTION_DIRECTORY: &str = ".stylon-transaction";
 
 #[derive(Clone, Debug)]
-pub(crate) struct Change {
-    pub(crate) path: PathBuf,
-    pub(crate) original: Option<Vec<u8>>,
-    pub(crate) replacement: Option<Vec<u8>>,
-    pub(crate) permissions: Option<Permissions>,
+pub struct Change {
+    pub path: PathBuf,
+    pub original: Option<Vec<u8>>,
+    pub replacement: Option<Vec<u8>>,
+    pub permissions: Option<Permissions>,
 }
 
-pub(crate) fn recover_if_needed(config: &Config, fix: bool) -> Result<(), OperationalError> {
+pub fn recover_if_needed(config: &Config, fix: bool) -> Result<(), OperationalError> {
     let transaction = config.root.join(TRANSACTION_DIRECTORY);
     if !transaction.exists() {
         return Ok(());
@@ -45,7 +45,7 @@ pub(crate) fn recover_if_needed(config: &Config, fix: bool) -> Result<(), Operat
     remove_transaction(&transaction, "recovered transaction")
 }
 
-pub(crate) fn apply(
+pub fn apply(
     config: &Config,
     changes: &[Change],
     inventory: &[(PathBuf, Vec<u8>)],

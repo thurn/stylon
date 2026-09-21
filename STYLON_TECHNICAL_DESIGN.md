@@ -611,6 +611,14 @@ Each convention has its own stable switch. Rules may share a change, so one
 import insertion can satisfy both type and enum-variant findings without
 duplicating edits.
 
+### `visibility.no-restricted`
+
+Declarations may be private or use unrestricted `pub`. The restricted forms
+`pub(crate)` and `pub(super)` are prohibited. This rule is diagnostic-only:
+choosing between private and public visibility changes API and module access,
+so Stylon never guesses a replacement. Other restricted forms, including
+`pub(self)` and `pub(in path)`, are outside this rule.
+
 ### Path qualification
 
 Path rules inspect syntax position and consult the project index when identity

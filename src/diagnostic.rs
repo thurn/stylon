@@ -3,69 +3,69 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct Position {
-    pub(crate) line: usize,
-    pub(crate) column: usize,
+pub struct Position {
+    pub line: usize,
+    pub column: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct DiagnosticRange {
-    pub(crate) byte_start: usize,
-    pub(crate) byte_end: usize,
-    pub(crate) start: Position,
-    pub(crate) end: Position,
+pub struct DiagnosticRange {
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub start: Position,
+    pub end: Position,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct Diagnostic {
-    pub(crate) rule_id: &'static str,
-    pub(crate) message: String,
-    pub(crate) path: PathBuf,
-    pub(crate) range: DiagnosticRange,
-    pub(crate) fix: &'static str,
+pub struct Diagnostic {
+    pub rule_id: &'static str,
+    pub message: String,
+    pub path: PathBuf,
+    pub range: DiagnosticRange,
+    pub fix: &'static str,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) applied: bool,
+    pub applied: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct OperationalError {
-    pub(crate) category: &'static str,
-    pub(crate) message: String,
+pub struct OperationalError {
+    pub category: &'static str,
+    pub message: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub(crate) paths: Vec<PathBuf>,
+    pub paths: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
-pub(crate) struct Summary {
-    pub(crate) files: usize,
-    pub(crate) findings: usize,
-    pub(crate) fixed: usize,
-    pub(crate) remaining: usize,
+pub struct Summary {
+    pub files: usize,
+    pub findings: usize,
+    pub fixed: usize,
+    pub remaining: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) timings: Option<Timings>,
+    pub timings: Option<Timings>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
-pub(crate) struct Timings {
-    pub(crate) discovery_ms: u64,
-    pub(crate) parsing_ms: u64,
-    pub(crate) rule_evaluation_ms: u64,
-    pub(crate) output_ms: u64,
-    pub(crate) files: usize,
-    pub(crate) bytes: usize,
-    pub(crate) syntax_nodes: usize,
+pub struct Timings {
+    pub discovery_ms: u64,
+    pub parsing_ms: u64,
+    pub rule_evaluation_ms: u64,
+    pub output_ms: u64,
+    pub files: usize,
+    pub bytes: usize,
+    pub syntax_nodes: usize,
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct JsonOutput<'a> {
-    pub(crate) schema_version: u8,
-    pub(crate) diagnostics: &'a [Diagnostic],
-    pub(crate) errors: &'a [OperationalError],
-    pub(crate) summary: &'a Summary,
+pub struct JsonOutput<'a> {
+    pub schema_version: u8,
+    pub diagnostics: &'a [Diagnostic],
+    pub errors: &'a [OperationalError],
+    pub summary: &'a Summary,
 }
 
 impl Diagnostic {
-    pub(crate) fn new(
+    pub fn new(
         rule_id: &'static str,
         message: impl Into<String>,
         path: PathBuf,
@@ -88,11 +88,11 @@ impl Diagnostic {
         }
     }
 
-    pub(crate) fn sort_key(&self) -> (&Path, usize, &str) {
+    pub fn sort_key(&self) -> (&Path, usize, &str) {
         (&self.path, self.range.byte_start, self.rule_id)
     }
 
-    pub(crate) fn without_fix(mut self) -> Self {
+    pub fn without_fix(mut self) -> Self {
         self.fix = "none";
         self
     }

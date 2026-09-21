@@ -8,10 +8,7 @@ use crate::diagnostic::OperationalError;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
-pub(crate) fn discover(
-    config: &Config,
-    requested: &Path,
-) -> Result<Vec<PathBuf>, Vec<OperationalError>> {
+pub fn discover(config: &Config, requested: &Path) -> Result<Vec<PathBuf>, Vec<OperationalError>> {
     let requested = fs::canonicalize(requested).map_err(|source| {
         vec![error(
             "discovery",

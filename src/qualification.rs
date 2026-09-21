@@ -16,11 +16,11 @@ use ra_ap_syntax::ast::Trait;
 use ra_ap_syntax::ast::TypeAlias;
 use ra_ap_syntax::ast::Union;
 
-pub(crate) fn check(config: &Config, relative: &Path, source: &str) -> Vec<Finding> {
+pub fn check(config: &Config, relative: &Path, source: &str) -> Vec<Finding> {
     check_with_module(config, relative, relative, source)
 }
 
-pub(crate) fn check_with_module(
+pub fn check_with_module(
     config: &Config,
     relative: &Path,
     module_relative: &Path,

@@ -18,19 +18,19 @@ use ra_ap_syntax::ast::Use;
 use ra_ap_syntax::ast::Visibility;
 
 #[derive(Clone, Debug)]
-pub(crate) struct RustInput<'a> {
-    pub(crate) path: &'a Path,
-    pub(crate) relative: PathBuf,
-    pub(crate) source: &'a str,
+pub struct RustInput<'a> {
+    pub path: &'a Path,
+    pub relative: PathBuf,
+    pub source: &'a str,
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct PublicFunctionAnalysis {
-    pub(crate) diagnostics: Vec<Diagnostic>,
-    pub(crate) replacements: BTreeMap<PathBuf, String>,
+pub struct PublicFunctionAnalysis {
+    pub diagnostics: Vec<Diagnostic>,
+    pub replacements: BTreeMap<PathBuf, String>,
 }
 
-pub(crate) fn analyze_public_functions(
+pub fn analyze_public_functions(
     config: &Config,
     inputs: &[RustInput<'_>],
 ) -> PublicFunctionAnalysis {
@@ -91,7 +91,7 @@ pub(crate) fn analyze_public_functions(
     analysis
 }
 
-pub(crate) fn check_top_level(config: &Config, relative: &Path, source: &str) -> Vec<Finding> {
+pub fn check_top_level(config: &Config, relative: &Path, source: &str) -> Vec<Finding> {
     if !config.rule_enabled("imports.top-level", relative) {
         return Vec::new();
     }

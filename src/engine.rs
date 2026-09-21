@@ -19,7 +19,7 @@ use crate::rules::Edit;
 use crate::transaction::{self, Change};
 use toml::Value;
 
-pub(crate) fn run(cli: &Cli) -> ExitCode {
+pub fn run(cli: &Cli) -> ExitCode {
     let started = Instant::now();
     if let Ok(metadata) = fs::symlink_metadata(&cli.path)
         && metadata.file_type().is_symlink()

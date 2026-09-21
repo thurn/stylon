@@ -19,6 +19,49 @@ fn config() -> (TempDir, Config) {
 }
 
 #[test]
+fn rejects_crate_and_super_visibility_without_offering_a_fix() {
+    let (_directory, config) = config();
+    let source = "pub(crate) struct CrateItem;\nmod child { pub(super) fn parent_item() {} pub(self) fn local_item() {} }\npub struct Public;\n";
+
+    let findings = check(&config, Path::new("src/lib.rs"), source);
+    let restricted: Vec<_> = findings
+        .iter()
+        .filter(|finding| finding.diagnostic.rule_id == "visibility.no-restricted")
+        .collect();
+
+    assert_eq!(restricted.len(), 2);
+    assert!(restricted.iter().all(|finding| finding.edits.is_empty()));
+    assert!(
+        restricted
+            .iter()
+            .all(|finding| finding.diagnostic.fix == "none")
+    );
+}
+
+#[test]
+fn allows_restricted_visibility_rule_to_be_disabled() {
+    let (directory, _) = config();
+    fs::write(
+        directory.path().join("stylon.toml"),
+        "version = 1\n\n[rules]\n\"visibility.no-restricted\" = false\n",
+    )
+    .expect("configuration");
+    let config = Config::load(directory.path(), None).expect("configuration");
+
+    let findings = check(
+        &config,
+        Path::new("src/lib.rs"),
+        "pub(crate) struct AllowedHere;\n",
+    );
+
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding.diagnostic.rule_id != "visibility.no-restricted")
+    );
+}
+
+#[test]
 fn orders_items_while_leaving_import_slots_fixed() {
     let (_directory, config) = config();
     let source = "fn private() {}\nuse std::fmt;\npub struct Public;\n";

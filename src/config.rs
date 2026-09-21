@@ -8,7 +8,7 @@ use serde::Deserialize;
 use crate::diagnostic::OperationalError;
 use toml::Value;
 
-pub(crate) const RULE_IDS: &[&str] = &[
+pub const RULE_IDS: &[&str] = &[
     "cargo.dependency-order",
     "cargo.workspace-inheritance",
     "imports.absolute-crate-path",
@@ -22,19 +22,20 @@ pub(crate) const RULE_IDS: &[&str] = &[
     "rustdoc.type-links",
     "tests.file-suffix",
     "tests.no-inline-module",
+    "visibility.no-restricted",
 ];
 
 #[derive(Clone, Debug)]
-pub(crate) struct Config {
-    pub(crate) root: PathBuf,
-    pub(crate) config_path: Option<PathBuf>,
+pub struct Config {
+    pub root: PathBuf,
+    pub config_path: Option<PathBuf>,
     exclude: GlobSet,
     rules: BTreeMap<String, bool>,
     overrides: Vec<Override>,
-    pub(crate) validation_command: Vec<String>,
-    pub(crate) validation_is_default: bool,
-    pub(crate) constant_macros: HashSet<String>,
-    pub(crate) test_attributes: HashSet<String>,
+    pub validation_command: Vec<String>,
+    pub validation_is_default: bool,
+    pub constant_macros: HashSet<String>,
+    pub test_attributes: HashSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -90,10 +91,7 @@ struct OverrideFile {
 }
 
 impl Config {
-    pub(crate) fn load(
-        requested: &Path,
-        explicit: Option<&Path>,
-    ) -> Result<Self, OperationalError> {
+    pub fn load(requested: &Path, explicit: Option<&Path>) -> Result<Self, OperationalError> {
         let requested = canonicalize(requested, "discovery")?;
         let config_path = match explicit {
             Some(path) => Some(canonicalize(path, "configuration")?),
@@ -186,17 +184,17 @@ impl Config {
         })
     }
 
-    pub(crate) fn relative(&self, path: &Path) -> PathBuf {
+    pub fn relative(&self, path: &Path) -> PathBuf {
         path.strip_prefix(&self.root)
             .expect("selected path is below root")
             .to_path_buf()
     }
 
-    pub(crate) fn is_excluded(&self, relative: &Path) -> bool {
+    pub fn is_excluded(&self, relative: &Path) -> bool {
         self.exclude.is_match(normalized(relative))
     }
 
-    pub(crate) fn rule_enabled(&self, rule_id: &str, relative: &Path) -> bool {
+    pub fn rule_enabled(&self, rule_id: &str, relative: &Path) -> bool {
         let mut enabled = self.rules.get(rule_id).copied().unwrap_or(true);
         let relative = normalized(relative);
         for entry in &self.overrides {

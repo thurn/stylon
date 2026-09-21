@@ -9,23 +9,20 @@ use crate::config::Config;
 use crate::diagnostic::{Diagnostic, OperationalError};
 
 #[derive(Clone, Debug)]
-pub(crate) struct ManifestInput<'a> {
-    pub(crate) path: &'a Path,
-    pub(crate) relative: PathBuf,
-    pub(crate) source: &'a str,
+pub struct ManifestInput<'a> {
+    pub path: &'a Path,
+    pub relative: PathBuf,
+    pub source: &'a str,
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct WorkspaceAnalysis {
-    pub(crate) diagnostics: Vec<Diagnostic>,
-    pub(crate) errors: Vec<OperationalError>,
-    pub(crate) replacements: BTreeMap<PathBuf, String>,
+pub struct WorkspaceAnalysis {
+    pub diagnostics: Vec<Diagnostic>,
+    pub errors: Vec<OperationalError>,
+    pub replacements: BTreeMap<PathBuf, String>,
 }
 
-pub(crate) fn analyze_workspace(
-    config: &Config,
-    manifests: &[ManifestInput<'_>],
-) -> WorkspaceAnalysis {
+pub fn analyze_workspace(config: &Config, manifests: &[ManifestInput<'_>]) -> WorkspaceAnalysis {
     let root_path = config.root.join("Cargo.toml");
     let Some(root_input) = manifests.iter().find(|input| input.path == root_path) else {
         return WorkspaceAnalysis::default();
