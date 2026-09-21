@@ -31,14 +31,38 @@ fn extracts_top_level_test_module() {
 
     let analysis = analyze_inline_tests(&config, &inputs);
 
-    assert!(analysis.errors.is_empty());
     assert_eq!(analysis.diagnostics.len(), 1);
-    assert!(analysis.replacements[&path].contains("#[path = \"crate_root_tests.rs\"]"));
-    let destination = path.parent().expect("parent").join("crate_root_tests.rs");
-    assert_eq!(
-        analysis.creations[&destination],
-        "use crate::*;\n\n#[test]\nfn works() {}\n"
-    );
+    assert!(analysis.errors.is_empty());
+    assert!(analysis.replacements.is_empty());
+    assert!(analysis.creations.is_empty());
+    assert!(analysis.deletions.is_empty());
+    assert!(analysis.moves.is_empty());
+}
+
+#[test]
+fn accepts_conventional_tests_file_name() {
+    let directory = tempdir().expect("temporary directory");
+    fs::create_dir(directory.path().join("src")).expect("source directory");
+    fs::write(
+        directory.path().join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    let path = fs::canonicalize(directory.path().join("src"))
+        .expect("source")
+        .join("tests.rs");
+    let source = "#[test]\nfn works() {}\n";
+    fs::write(&path, source).expect("source file");
+    let config = Config::load(directory.path(), None).expect("configuration");
+    let inputs = [RustInput {
+        path: &path,
+        relative: "src/tests.rs".into(),
+        source,
+    }];
+
+    let analysis = analyze_file_suffix(&config, &inputs, &std::collections::BTreeMap::new());
+
+    assert!(analysis.diagnostics.is_empty());
 }
 
 #[test]

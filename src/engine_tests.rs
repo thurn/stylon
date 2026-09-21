@@ -58,7 +58,7 @@ fn fix_is_clean_and_idempotent() {
 }
 
 #[test]
-fn fix_extracts_inline_tests_transactionally() {
+fn fix_does_not_extract_inline_tests() {
     let directory = tempdir().expect("temporary directory");
     fs::create_dir(directory.path().join("src")).expect("source directory");
     fs::write(
@@ -84,19 +84,12 @@ fn fix_extracts_inline_tests_transactionally() {
     ];
 
     assert_eq!(
-        super::super::run(arguments.clone()),
-        std::process::ExitCode::SUCCESS
+        super::super::run(arguments),
+        std::process::ExitCode::FAILURE
     );
     let source = fs::read_to_string(&source_path).expect("fixed source");
-    assert!(source.contains("#[path = \"crate_root_tests.rs\"]"));
-    assert!(!source.contains("mod tests {"));
-    let tests = fs::read_to_string(directory.path().join("src/crate_root_tests.rs"))
-        .expect("extracted tests");
-    assert!(tests.contains("use crate::*;"));
-    assert_eq!(
-        super::super::run(arguments),
-        std::process::ExitCode::SUCCESS
-    );
+    assert!(source.contains("mod tests {"));
+    assert!(!directory.path().join("src/crate_root_tests.rs").exists());
 }
 
 #[test]

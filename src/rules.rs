@@ -298,22 +298,14 @@ fn item_role(config: &Config, item: &ast::Item) -> ItemRole {
 fn category(item: &ast::Item) -> u8 {
     let visibility = visibility(item);
     match (visibility, item) {
-        (Visibility::Private, ast::Item::Const(_)) => 1,
-        (Visibility::Private, ast::Item::Static(_)) => 2,
+        (Visibility::Private | Visibility::Restricted, ast::Item::Const(_)) => 1,
+        (Visibility::Private | Visibility::Restricted, ast::Item::Static(_)) => 2,
         (Visibility::Public, ast::Item::TypeAlias(_)) => 4,
         (Visibility::Public, ast::Item::Const(_) | ast::Item::Static(_)) => 5,
         (Visibility::Public, ast::Item::Trait(_)) => 6,
         (Visibility::Public, ast::Item::Struct(_) | ast::Item::Enum(_) | ast::Item::Union(_)) => 7,
         (Visibility::Public, ast::Item::Fn(_)) => 8,
-        (Visibility::Restricted, ast::Item::TypeAlias(_)) => 9,
-        (Visibility::Restricted, ast::Item::Const(_) | ast::Item::Static(_)) => 10,
-        (Visibility::Restricted, ast::Item::Trait(_)) => 11,
-        (
-            Visibility::Restricted,
-            ast::Item::Struct(_) | ast::Item::Enum(_) | ast::Item::Union(_),
-        ) => 12,
-        (Visibility::Restricted, ast::Item::Fn(_)) => 13,
-        _ => 14,
+        _ => 9,
     }
 }
 

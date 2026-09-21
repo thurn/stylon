@@ -40,6 +40,23 @@ fn shortens_type_variant_and_function_paths_with_shared_imports() {
 }
 
 #[test]
+fn groups_inserted_imports_by_shared_prefix() {
+    let (_directory, config) = config();
+    let source = "fn view(group: reactant::world::Group, sprite: reactant::world::Sprite) {}\n";
+    let findings = check(&config, Path::new("src/lib.rs"), source);
+    let mut fixed = source.to_owned();
+    let mut edits = findings[0].edits.clone();
+    edits.sort_by_key(|edit| edit.range.start);
+    for edit in edits.into_iter().rev() {
+        fixed.replace_range(edit.range, &edit.replacement);
+    }
+
+    assert!(fixed.contains("use reactant::world::{Group, Sprite};"));
+    assert!(!fixed.contains("use reactant::world::Group;"));
+    assert!(!fixed.contains("use reactant::world::Sprite;"));
+}
+
+#[test]
 fn rewrites_relative_imports_from_the_file_module() {
     let (_directory, config) = config();
     let source = "use super::card::Card;\n";

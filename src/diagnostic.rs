@@ -91,6 +91,11 @@ impl Diagnostic {
     pub(crate) fn sort_key(&self) -> (&Path, usize, &str) {
         (&self.path, self.range.byte_start, self.rule_id)
     }
+
+    pub(crate) fn without_fix(mut self) -> Self {
+        self.fix = "none";
+        self
+    }
 }
 
 fn position(source: &str, offset: usize) -> Position {

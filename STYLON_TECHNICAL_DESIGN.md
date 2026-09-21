@@ -13,9 +13,9 @@ The design has four controlling requirements:
 - A full scan of a 100,000-line Rust project must finish in at most five
   seconds. The acceptance corpus is larger: Battlement currently contains
   141,784 tracked Rust lines at the pinned revision.
-- Every style finding must have a deterministic machine-applicable fix.
-  Conditions that prevent a safe fix are operational errors, not unfixable
-  style findings.
+- Style findings have deterministic machine-applicable fixes unless a rule is
+  explicitly diagnostic-only. Fix mode writes nothing while any enabled
+  diagnostic-only finding remains.
 - Adding a rule must require a small, isolated Rust implementation rather than
   changes throughout the scanner or fixer.
 - Rules may be enabled or disabled for the project or selected directories only
@@ -109,7 +109,8 @@ Exit status is a stable automation interface:
 
 - `0` means check mode found no enabled violations, or fix mode completed and
   passed validation.
-- `1` means check mode found one or more style violations.
+- `1` means check mode found one or more style violations, or fix mode was
+  blocked by an enabled diagnostic-only finding.
 - `2` means configuration, discovery, parsing, analysis, planning, filesystem,
   preflight, or post-fix validation failed.
 
@@ -145,7 +146,7 @@ partial result.
 
 Every diagnostic contains a stable rule ID, message, project-relative path,
 half-open UTF-8 byte range, one-based line and Unicode-scalar column range, and
-the literal fix value `machine-applicable`. `byte_end` is the first byte after
+a fix value of `machine-applicable` or `none`. `byte_end` is the first byte after
 the finding. CRLF occupies two bytes but advances one line. Edit text is
 intentionally not part of the public JSON schema.
 
@@ -489,14 +490,14 @@ treated as a clean run.
 ## Fix Planning and Transactions
 
 Fix mode separates deciding changes from writing them. This is necessary
-because a test extraction can create imports that another rule must rewrite,
-and two independently correct edits can overlap.
+because a test-file rename can require module and manifest updates, and two
+independently correct edits can overlap.
 
 Planning uses a virtual filesystem initialized from the immutable scan. It
 applies rule changes in a deterministic priority order:
 
 1. manifest and filesystem structure changes;
-2. inline-module/test extraction or file renaming;
+2. test file renaming;
 3. import and path rewrites;
 4. item ordering; and
 5. blank-line normalization.
@@ -520,13 +521,12 @@ model, and effective rule policy. Repeating a hash is a cycle. More than eight
 passes is a `non-converging-fix` error. This is a defensive limit, not a proof
 that arbitrary rule combinations converge.
 
-For example, extracting an inline test can expose three later changes:
+For example, renaming a test module can expose later changes:
 
 ```text
-pass 1: `mod tests { ... }` -> external `parser_tests.rs`
-pass 2: `use super::*` -> absolute, explicit imports in the new file
-pass 3: direct function imports -> module-qualified calls
-pass 4: reorder items and insert blank lines; pass 5 is clean
+pass 1: `parser.rs` -> `parser_tests.rs`
+pass 2: update the parent module declaration
+pass 3: reorder items and insert blank lines; pass 4 is clean
 ```
 
 Destination collisions include case-fold-equivalent paths, an existing
@@ -833,35 +833,14 @@ inline-module conventions independently.
 
 #### `tests.no-inline-module`
 
-A top-level inline module named `tests` is prohibited. The fix moves its body to
-an external file ending in `_tests.rs` and leaves an external declaration with
-the same module name. A `#[path = "..."]` attribute preserves the name when the
-required filename differs from Rust's conventional lookup path.
-
-For `foo.rs`, the destination is sibling `foo_tests.rs`; for `foo/mod.rs`, it
-is `foo/foo_tests.rs`; and for a crate root it is sibling
-`crate_root_tests.rs`. The retained declaration is:
-
-```rust
-#[cfg(test)]
-#[path = "foo_tests.rs"]
-mod tests;
-```
-
-Compute the path using Rust's module-directory and `#[path]` rules, including
-inline ancestors. Preserve the original declaration's attributes and condition;
-the example assumes the original was `#[cfg(test)]`. Do not add `cfg(test)` to
-an unconditional module. Keep conditional declarations separate in uniquely
-named `_tests.rs` files rather than merging bodies with potentially duplicate
-items. An existing destination is a planning conflict.
-
-Nested modules and their visibility remain unchanged. Imports are re-evaluated
-after extraction, so `use super::*` is replaced through the ordinary import
-rules rather than copied as a permanent exception.
+A top-level inline module named `tests` is prohibited. This is diagnostic-only:
+moving tests can change privacy, module paths, macro scope, and non-Rust tooling
+assumptions, so Stylon never attempts the refactor automatically.
 
 #### `tests.file-suffix`
 
-A Rust file directly containing a test function must end in `_tests.rs`.
+A Rust file directly containing a test function must be named `tests.rs` or end
+in `_tests.rs`.
 Functions inside an inline module belong to that module for this rule; they do
 not also force a rename of the enclosing production file. Inline `tests`
 extraction is handled by the separate rule, avoiding rename/extraction cycles. A test function
@@ -881,7 +860,6 @@ The fix moves the file and updates every known structural reference:
 - external module declarations and `#[path]` attributes;
 - explicit Cargo target paths;
 - literal Rust include macros; and
-- generated declarations from inline-test extraction.
 
 For an integration test, Stylon preserves the old Cargo test target name with
 an explicit `[[test]]` entry pointing to the new `_tests.rs` path. Existing
@@ -999,16 +977,13 @@ this order:
 6. unrestricted public traits;
 7. unrestricted public structs, enums, and unions;
 8. unrestricted public functions;
-9. restricted-visibility type aliases;
-10. restricted-visibility constants and statics;
-11. restricted-visibility traits;
-12. restricted-visibility structs, enums, and unions;
-13. restricted-visibility functions;
-14. all remaining private and uncategorized ordinary items; and
-15. test module declarations.
+9. all remaining private, restricted-visibility, and uncategorized ordinary
+   items; and
+10. test module declarations.
 
 Restricted visibility includes `pub(crate)`, `pub(super)`, `pub(self)`, and
-`pub(in path)`. Items keep their relative order within one category. Stylon
+`pub(in path)` and is treated as crate-private implementation detail. Items keep
+their relative order within one category. Stylon
 collects the source ranges of orderable items in one macro-bounded run, stable
 sorts their complete text, and writes the results back into those same item
 slots. Imports and ordinary external module declarations therefore stay at
@@ -1016,7 +991,7 @@ their byte positions while ordinary items may exchange slots on either side.
 
 A test module declaration is an external module whose normalized effective
 condition requires `test`, using the same compound-`cfg` rules as import
-placement, or the declaration produced by inline-test extraction. Unknown
+placement. Unknown
 macro invocations, `macro_rules!` definitions, global assembly, and foreign
 macro item families are barriers. Ordinary impls, extern blocks, and foreign
 modules are uncategorized private items. No finding compares items across a
@@ -1221,15 +1196,14 @@ Cross-rule fixtures cover shared and conflicting edits, including:
 
 - type and variant findings that need the same import;
 - hoisted imports followed by direct-function rewriting;
-- test extraction followed by absolute crate import rewriting;
-- inline-module extraction followed by item ordering and Rustdoc resolution;
+- test file renaming followed by absolute crate import rewriting;
 - path collisions requiring shortest unique qualification; and
 - comments and `cfg` attributes moving with their items.
 
 Black-box Cargo fixtures validate compile-sensitive behavior:
 
 - ordinary library/root items remain in place unless another enabled rule applies;
-- inline-module extraction preserves relative paths and macro scope;
+- inline test modules remain diagnostic-only in fix mode;
 - explicit and auto-discovered integration tests retain their old target names;
 - alternative `cfg` declarations agree or produce a planning error;
 - workspace dependency promotion preserves features and optionality; and

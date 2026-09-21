@@ -202,7 +202,13 @@ pub(crate) fn run(cli: &Cli) -> ExitCode {
         timings.rule_evaluation_ms = milliseconds(evaluation_started.elapsed());
     }
 
-    if cli.fix && errors.is_empty() && !diagnostics.is_empty() {
+    if cli.fix
+        && errors.is_empty()
+        && !diagnostics.is_empty()
+        && diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.fix == "machine-applicable")
+    {
         match plan_changes(
             &config,
             &parsed,

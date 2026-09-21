@@ -65,26 +65,16 @@ pub(crate) fn check_with_module(
         .filter_map(|candidate| candidate.import.clone())
         .collect();
     for (insertion, imports) in group_imports(imports) {
-        let text = imports
+        let imports: Vec<_> = imports
             .into_iter()
             .filter(|import| !has_import_near(source, insertion, &import.path))
-            .map(|import| {
-                if import.cfg_test {
-                    format!(
-                        "{}#[cfg(test)]\n{}use {};\n",
-                        import.indent, import.indent, import.path
-                    )
-                } else {
-                    format!("{}use {};\n", import.indent, import.path)
-                }
-            })
-            .collect::<String>();
-        if text.is_empty() {
+            .collect();
+        if imports.is_empty() {
             continue;
         }
         edits.push(Edit {
             range: insertion..insertion,
-            replacement: text,
+            replacement: format_imports(&imports),
         });
     }
 
@@ -542,6 +532,59 @@ fn group_imports(imports: BTreeSet<PlannedImport>) -> BTreeMap<usize, Vec<Planne
         groups.entry(import.insertion).or_default().push(import);
     }
     groups
+}
+
+#[derive(Default)]
+struct ImportTree {
+    terminal: bool,
+    children: BTreeMap<String, ImportTree>,
+}
+
+fn format_imports(imports: &[PlannedImport]) -> String {
+    let mut groups: BTreeMap<(bool, String), ImportTree> = BTreeMap::new();
+    for import in imports {
+        let tree = groups
+            .entry((import.cfg_test, import.indent.clone()))
+            .or_default();
+        let mut node = tree;
+        for segment in import.path.split("::") {
+            node = node.children.entry(segment.to_owned()).or_default();
+        }
+        node.terminal = true;
+    }
+    let mut formatted = String::new();
+    for ((cfg_test, indent), tree) in groups {
+        for (root, node) in tree.children {
+            if cfg_test {
+                formatted.push_str(&format!("{indent}#[cfg(test)]\n"));
+            }
+            formatted.push_str(&format!(
+                "{indent}use {};\n",
+                render_import_branch(&root, &node)
+            ));
+        }
+    }
+    formatted
+}
+
+fn render_import_branch(segment: &str, node: &ImportTree) -> String {
+    if !node.terminal && node.children.len() == 1 {
+        let (child, child_node) = node.children.first_key_value().expect("one child exists");
+        return format!("{segment}::{}", render_import_branch(child, child_node));
+    }
+    if node.children.is_empty() {
+        return segment.to_owned();
+    }
+    let mut entries = Vec::new();
+    if node.terminal {
+        entries.push("self".to_owned());
+    }
+    entries.extend(
+        node.children
+            .iter()
+            .map(|(child, child_node)| render_import_branch(child, child_node)),
+    );
+    format!("{segment}::{{{}}}", entries.join(", "))
 }
 
 fn has_import_near(source: &str, insertion: usize, path: &str) -> bool {
