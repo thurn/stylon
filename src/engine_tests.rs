@@ -93,6 +93,36 @@ fn fix_does_not_extract_inline_tests() {
 }
 
 #[test]
+fn integration_only_rejects_source_tests_without_moving_them() {
+    let directory = tempdir().expect("temporary directory");
+    fs::create_dir(directory.path().join("src")).expect("source directory");
+    fs::write(
+        directory.path().join("Cargo.toml"),
+        "[package]\nname='integration_only_fixture'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .expect("manifest");
+    fs::write(
+        directory.path().join("stylon.toml"),
+        "version = 1\n[rules]\n\"tests.integration-only\" = true\n",
+    )
+    .expect("configuration");
+    let source_path = directory.path().join("src/lib.rs");
+    let source = "#[cfg(test)]\nmod checks;\n";
+    fs::write(&source_path, source).expect("source");
+    let arguments = [
+        OsString::from("stylon"),
+        OsString::from("--fix"),
+        directory.path().as_os_str().to_owned(),
+    ];
+
+    assert_eq!(
+        super::super::run(arguments),
+        std::process::ExitCode::FAILURE
+    );
+    assert_eq!(fs::read_to_string(source_path).expect("source"), source);
+}
+
+#[test]
 fn fix_renames_integration_tests_without_changing_target_name() {
     let directory = tempdir().expect("temporary directory");
     fs::create_dir_all(directory.path().join("src")).expect("source directory");

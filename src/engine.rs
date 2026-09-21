@@ -118,6 +118,14 @@ pub fn run(cli: &Cli) -> ExitCode {
             source: &file.source,
         })
         .collect();
+    let manifests: std::collections::BTreeMap<_, _> = manifest_inputs
+        .iter()
+        .map(|input| (input.path.to_path_buf(), input.source.to_owned()))
+        .collect();
+    let integration_only =
+        crate::tests_layout::analyze_integration_only(&config, &rust_inputs, &manifests);
+    diagnostics.extend(integration_only.diagnostics);
+    errors.extend(integration_only.errors);
     let inline_tests = crate::tests_layout::analyze_inline_tests(&config, &rust_inputs);
     diagnostics.extend(inline_tests.diagnostics.clone());
     errors.extend(inline_tests.errors.clone());
@@ -150,10 +158,7 @@ pub fn run(cli: &Cli) -> ExitCode {
                 source,
             }),
     );
-    let mut virtual_manifests: std::collections::BTreeMap<_, _> = manifest_inputs
-        .iter()
-        .map(|input| (input.path.to_path_buf(), input.source.to_owned()))
-        .collect();
+    let mut virtual_manifests = manifests;
     virtual_manifests.extend(workspace.replacements.clone());
     let mut file_suffix =
         crate::tests_layout::analyze_file_suffix(&config, &inline_inputs, &virtual_manifests);
@@ -304,13 +309,17 @@ fn verify_plan(
             source,
         })
         .collect();
-    let inline_tests = crate::tests_layout::analyze_inline_tests(config, &rust_inputs);
-    diagnostics.extend(inline_tests.diagnostics);
-    errors.extend(inline_tests.errors);
     let manifests = manifest_inputs
         .iter()
         .map(|input| (input.path.to_path_buf(), input.source.to_owned()))
         .collect();
+    let integration_only =
+        crate::tests_layout::analyze_integration_only(config, &rust_inputs, &manifests);
+    diagnostics.extend(integration_only.diagnostics);
+    errors.extend(integration_only.errors);
+    let inline_tests = crate::tests_layout::analyze_inline_tests(config, &rust_inputs);
+    diagnostics.extend(inline_tests.diagnostics);
+    errors.extend(inline_tests.errors);
     let file_suffix = crate::tests_layout::analyze_file_suffix(config, &rust_inputs, &manifests);
     diagnostics.extend(file_suffix.diagnostics);
     errors.extend(file_suffix.errors);

@@ -175,8 +175,8 @@ execution must never alter output order.
 ## Configuration
 
 Stylon uses at most one root `stylon.toml` for a run. If no configuration is
-found, every rule is enabled, Git-aware ignore behavior applies, and the
-default validation command is used.
+found, rules are enabled except for opt-in architectural policies, Git-aware
+ignore behavior applies, and the default validation command is used.
 
 The configuration schema begins with `version = 1`. Unknown keys, unknown rule
 IDs, invalid globs, multiple applicable configuration files, and unsupported
@@ -207,7 +207,8 @@ paths = ["crates/legacy/**"]
 
 Configuration paths use `/` separators and are matched relative to the
 configuration root. `**` crosses directories. Root rule settings override the
-built-in enabled defaults. Matching override blocks are then applied in file
+built-in defaults. `tests.integration-only` is disabled unless configured;
+other rules are enabled. Matching override blocks are then applied in file
 order, and the last assignment to a rule wins.
 
 Globs are case-sensitive on every platform. A leading `/` is rejected, a
@@ -838,6 +839,24 @@ this rule.
 
 Test placement has separate switches because projects may adopt filename and
 inline-module conventions independently.
+
+#### `tests.integration-only`
+
+This opt-in, diagnostic-only rule requires tests to live beneath the owning
+Cargo package's `tests/` directory. Outside that directory it rejects recognized
+test functions, attributes whose `cfg` or `cfg_attr` predicate refers to
+`test`, and files named `tests.rs` or ending in `_tests.rs`. Files without an
+owning manifest are outside the rule because Stylon cannot establish a Cargo
+test boundary for them.
+
+The policy does not move code. Relocating unit tests can change privacy, module
+paths, macro scope, and the public API needed by integration tests. Enable it
+explicitly for packages whose tests must use only public interfaces:
+
+```toml
+[rules]
+"tests.integration-only" = true
+```
 
 #### `tests.no-inline-module`
 

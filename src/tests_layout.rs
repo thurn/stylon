@@ -21,6 +21,72 @@ pub struct TestLayoutAnalysis {
     pub moves: BTreeMap<PathBuf, PathBuf>,
 }
 
+pub fn analyze_integration_only(
+    config: &Config,
+    inputs: &[RustInput<'_>],
+    manifests: &BTreeMap<PathBuf, String>,
+) -> TestLayoutAnalysis {
+    let mut analysis = TestLayoutAnalysis::default();
+    for input in inputs {
+        if !config.rule_enabled("tests.integration-only", &input.relative) {
+            continue;
+        }
+        let Some((manifest, manifest_source)) = owning_manifest(input.path, manifests) else {
+            continue;
+        };
+        let Ok(manifest_document) = manifest_source.parse::<DocumentMut>() else {
+            continue;
+        };
+        if manifest_document.get("package").is_none() {
+            continue;
+        }
+        let package_directory = manifest.parent().expect("manifest has a parent");
+        let Ok(package_relative) = input.path.strip_prefix(package_directory) else {
+            continue;
+        };
+        if package_relative.starts_with("tests") {
+            continue;
+        }
+
+        let parsed = SourceFile::parse(input.source, Edition::Edition2024);
+        let violation = test_named_file(input.path)
+            .then_some(0..0)
+            .or_else(|| {
+                parsed
+                    .tree()
+                    .syntax()
+                    .descendants()
+                    .filter_map(Fn::cast)
+                    .find(|function| is_test_function(config, function))
+                    .map(|function| text_range(function.syntax()))
+            })
+            .or_else(|| {
+                parsed
+                    .tree()
+                    .syntax()
+                    .descendants()
+                    .filter_map(ast::Attr::cast)
+                    .find(references_test_configuration)
+                    .map(|attribute| text_range(attribute.syntax()))
+            });
+        let Some(range) = violation else {
+            continue;
+        };
+        analysis.diagnostics.push(
+            Diagnostic::new(
+                "tests.integration-only",
+                "tests must be defined in Cargo integration targets under `tests/`",
+                input.relative.clone(),
+                input.source,
+                range.start,
+                range.end,
+            )
+            .without_fix(),
+        );
+    }
+    analysis
+}
+
 pub fn analyze_file_suffix(
     config: &Config,
     inputs: &[RustInput<'_>],
@@ -325,6 +391,39 @@ fn recognized_attribute(config: &Config, text: &str) -> bool {
     }
     let path = inner.split(['(', '=']).next().unwrap_or(inner).trim();
     config.test_attributes.contains(path) || path.rsplit("::").next() == Some("test")
+}
+
+fn test_named_file(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        let name = name.to_string_lossy();
+        name == "tests.rs" || name.ends_with("_tests.rs")
+    })
+}
+
+fn references_test_configuration(attribute: &ast::Attr) -> bool {
+    attribute.meta().is_some_and(meta_references_test)
+}
+
+fn meta_references_test(meta: ast::Meta) -> bool {
+    match meta {
+        ast::Meta::CfgMeta(meta) => meta.cfg_predicate().is_some_and(predicate_references_test),
+        ast::Meta::CfgAttrMeta(meta) => {
+            meta.cfg_predicate().is_some_and(predicate_references_test)
+                || meta.metas().any(meta_references_test)
+        }
+        _ => false,
+    }
+}
+
+fn predicate_references_test(predicate: ast::CfgPredicate) -> bool {
+    match predicate {
+        ast::CfgPredicate::CfgAtom(atom) => atom
+            .ident_token()
+            .is_some_and(|identifier| identifier.text() == "test"),
+        ast::CfgPredicate::CfgComposite(composite) => {
+            composite.cfg_predicates().any(predicate_references_test)
+        }
+    }
 }
 
 fn is_integration_test(relative: &Path) -> bool {

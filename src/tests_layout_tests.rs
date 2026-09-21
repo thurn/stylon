@@ -4,7 +4,7 @@ use tempfile::tempdir;
 
 use crate::config::Config;
 use crate::imports::RustInput;
-use crate::tests_layout::{analyze_file_suffix, analyze_inline_tests};
+use crate::tests_layout::{analyze_file_suffix, analyze_inline_tests, analyze_integration_only};
 use toml::Value;
 
 #[test]
@@ -173,4 +173,92 @@ fn updates_an_explicit_integration_target_without_losing_options() {
     assert_eq!(target["path"].as_str(), Some("tests/gameplay_tests.rs"));
     assert_eq!(target["harness"].as_bool(), Some(false));
     assert_eq!(target["required-features"][0].as_str(), Some("extra"));
+}
+
+#[test]
+fn rejects_test_code_outside_the_integration_test_directory() {
+    let directory = integration_only_fixture();
+    let path = directory.path().join("src/lib.rs");
+    let source = "#[cfg(test)]\nmod checks {\n    #[test]\n    fn works() {}\n}\n";
+    fs::write(&path, source).expect("source file");
+
+    let analysis = integration_only_analysis(directory.path(), &path, source);
+
+    assert_eq!(analysis.diagnostics.len(), 1);
+    assert_eq!(analysis.diagnostics[0].rule_id, "tests.integration-only");
+    assert_eq!(analysis.diagnostics[0].fix, "none");
+}
+
+#[test]
+fn rejects_test_named_source_files_without_test_attributes() {
+    let directory = integration_only_fixture();
+    let path = directory.path().join("src/parser_tests.rs");
+    let source = "fn helper() {}\n";
+    fs::write(&path, source).expect("source file");
+
+    let analysis = integration_only_analysis(directory.path(), &path, source);
+
+    assert_eq!(analysis.diagnostics.len(), 1);
+}
+
+#[test]
+fn accepts_tests_and_support_modules_under_tests() {
+    let directory = integration_only_fixture();
+    let tests_directory = directory.path().join("tests/support");
+    fs::create_dir_all(&tests_directory).expect("tests directory");
+    let path = tests_directory.join("mod.rs");
+    let source = "#[cfg(test)]\n#[test]\nfn helper_contract() {}\n";
+    fs::write(&path, source).expect("source file");
+
+    let analysis = integration_only_analysis(directory.path(), &path, source);
+
+    assert!(analysis.diagnostics.is_empty());
+}
+
+#[test]
+fn accepts_a_feature_named_test_outside_the_test_directory() {
+    let directory = integration_only_fixture();
+    let path = directory.path().join("src/lib.rs");
+    let source = "#[cfg(feature = \"test\")]\nfn optional() {}\n";
+    fs::write(&path, source).expect("source file");
+
+    let analysis = integration_only_analysis(directory.path(), &path, source);
+
+    assert!(analysis.diagnostics.is_empty());
+}
+
+fn integration_only_fixture() -> tempfile::TempDir {
+    let directory = tempdir().expect("temporary directory");
+    fs::create_dir(directory.path().join("src")).expect("source directory");
+    fs::write(
+        directory.path().join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+    fs::write(
+        directory.path().join("stylon.toml"),
+        "version = 1\n[rules]\n\"tests.integration-only\" = true\n",
+    )
+    .expect("configuration");
+    directory
+}
+
+fn integration_only_analysis(
+    directory: &std::path::Path,
+    path: &std::path::Path,
+    source: &str,
+) -> crate::tests_layout::TestLayoutAnalysis {
+    let config = Config::load(directory, None).expect("configuration");
+    let manifest = fs::canonicalize(directory.join("Cargo.toml")).expect("canonical manifest");
+    let path = fs::canonicalize(path).expect("canonical source");
+    let inputs = [RustInput {
+        path: &path,
+        relative: config.relative(&path),
+        source,
+    }];
+    let manifests = std::collections::BTreeMap::from([(
+        manifest.clone(),
+        fs::read_to_string(manifest).expect("manifest source"),
+    )]);
+    analyze_integration_only(&config, &inputs, &manifests)
 }

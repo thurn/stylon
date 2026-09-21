@@ -21,6 +21,7 @@ pub const RULE_IDS: &[&str] = &[
     "path.type-qualification",
     "rustdoc.type-links",
     "tests.file-suffix",
+    "tests.integration-only",
     "tests.no-inline-module",
     "visibility.no-restricted",
 ];
@@ -195,7 +196,11 @@ impl Config {
     }
 
     pub fn rule_enabled(&self, rule_id: &str, relative: &Path) -> bool {
-        let mut enabled = self.rules.get(rule_id).copied().unwrap_or(true);
+        let mut enabled = self
+            .rules
+            .get(rule_id)
+            .copied()
+            .unwrap_or_else(|| rule_id != "tests.integration-only");
         let relative = normalized(relative);
         for entry in &self.overrides {
             if entry.paths.is_match(&relative) {

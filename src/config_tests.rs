@@ -30,6 +30,27 @@ paths = ["src/**"]
 }
 
 #[test]
+fn integration_only_is_opt_in() {
+    let directory = tempdir().expect("temporary directory");
+    fs::write(
+        directory.path().join("Cargo.toml"),
+        "[package]\nname='fixture'\nversion='0.1.0'\n",
+    )
+    .expect("manifest");
+
+    let default = Config::load(directory.path(), None).expect("default configuration");
+    assert!(!default.rule_enabled("tests.integration-only", Path::new("src/lib.rs")));
+
+    fs::write(
+        directory.path().join("stylon.toml"),
+        "version = 1\n[rules]\n\"tests.integration-only\" = true\n",
+    )
+    .expect("configuration");
+    let enabled = Config::load(directory.path(), None).expect("configured policy");
+    assert!(enabled.rule_enabled("tests.integration-only", Path::new("src/lib.rs")));
+}
+
+#[test]
 fn rejects_a_configuration_without_a_version() {
     let directory = tempdir().expect("temporary directory");
     fs::write(directory.path().join("stylon.toml"), "[rules]\n").expect("configuration");
