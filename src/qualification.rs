@@ -29,7 +29,7 @@ pub fn check_with_module(
     let parsed = SourceFile::parse(source, Edition::Edition2024);
     let file = parsed.tree();
     let bindings = imported_type_names(&file);
-    let aliases = module_aliases(&file);
+    let aliases = module_aliases(file.items());
     let mut candidates = Vec::new();
     if config.rule_enabled("path.type-qualification", relative) {
         collect_type_paths(source, &file, &bindings, &aliases, &mut candidates);
@@ -47,6 +47,7 @@ pub fn check_with_module(
         collect_relative_imports(module_relative, &file, &mut candidates);
     }
     remove_type_collisions(&mut candidates);
+    reuse_declared_modules(&file, module_relative, &mut candidates);
     candidates.sort_by_key(|candidate| candidate.range.start);
     candidates.dedup_by(|left, right| left.range == right.range);
     if candidates.is_empty() {
@@ -130,6 +131,8 @@ fn collect_type_paths(
         let Some(segments) = simple_segments(&path) else {
             continue;
         };
+        let scoped_aliases = enclosing_module_aliases(path.syntax());
+        let aliases = scoped_aliases.as_ref().unwrap_or(aliases);
         if segments.len() < 2
             || exempt_path_root(&segments[0], aliases)
             || generic_type_parameter(path.syntax(), &segments[0])
@@ -137,7 +140,7 @@ fn collect_type_paths(
             continue;
         }
         let leaf = segments.last().expect("path has a leaf").clone();
-        if bindings.contains(&leaf) {
+        if bindings.contains(&leaf) && !imports_same_path(&segments, aliases) {
             continue;
         }
         candidates.push(Candidate {
@@ -145,12 +148,7 @@ fn collect_type_paths(
             message: "type name must be unqualified",
             range: text_range(path.syntax()),
             replacement: leaf,
-            import: Some(PlannedImport {
-                path: canonical_path(&segments, aliases),
-                cfg_test: false,
-                insertion: scoped_import_insertion(file, path.syntax(), source).0,
-                indent: scoped_import_insertion(file, path.syntax(), source).1,
-            }),
+            import: plan_import(&segments, aliases, file, path.syntax(), source),
         });
     }
 }
@@ -171,6 +169,8 @@ fn collect_expression_paths(
         let Some(segments) = simple_segments(&path) else {
             continue;
         };
+        let scoped_aliases = enclosing_module_aliases(path.syntax());
+        let aliases = scoped_aliases.as_ref().unwrap_or(aliases);
         if segments.len() < 3
             || exempt_path_root(&segments[0], aliases)
             || generic_type_parameter(path.syntax(), &segments[0])
@@ -179,7 +179,8 @@ fn collect_expression_paths(
         }
         let terminal = segments.last().expect("path has a terminal");
         let parent = &segments[segments.len() - 2];
-        if bindings.contains(parent) {
+        if bindings.contains(parent) && !imports_same_path(&segments[..segments.len() - 1], aliases)
+        {
             continue;
         }
         let is_call = expression
@@ -225,12 +226,13 @@ fn collect_expression_paths(
                 message: "free function may have at most one module qualifier",
                 range: text_range(path.syntax()),
                 replacement: segments[segments.len() - 2..].join("::"),
-                import: Some(PlannedImport {
-                    path: canonical_path(&segments[..segments.len() - 1], aliases),
-                    cfg_test: false,
-                    insertion: scoped_import_insertion(file, path.syntax(), source).0,
-                    indent: scoped_import_insertion(file, path.syntax(), source).1,
-                }),
+                import: plan_import(
+                    &segments[..segments.len() - 1],
+                    aliases,
+                    file,
+                    path.syntax(),
+                    source,
+                ),
             });
         }
     }
@@ -252,13 +254,91 @@ fn add_shortened(
         message,
         range: text_range(path.syntax()),
         replacement: segments[segments.len() - 2..].join("::"),
-        import: Some(PlannedImport {
-            path: canonical_path(&segments[..segments.len() - 1], aliases),
-            cfg_test: false,
-            insertion: scoped_import_insertion(file, path.syntax(), source).0,
-            indent: scoped_import_insertion(file, path.syntax(), source).1,
-        }),
+        import: plan_import(
+            &segments[..segments.len() - 1],
+            aliases,
+            file,
+            path.syntax(),
+            source,
+        ),
     });
+}
+
+fn reuse_declared_modules(file: &ast::SourceFile, relative: &Path, candidates: &mut [Candidate]) {
+    for candidate in candidates {
+        let Some(import) = &candidate.import else {
+            continue;
+        };
+        let Some(node) = file
+            .syntax()
+            .descendants()
+            .find(|node| text_range(node) == candidate.range)
+        else {
+            continue;
+        };
+        let modules: Vec<_> = node.ancestors().filter_map(ast::Module::cast).collect();
+        let items: Vec<_> = modules
+            .first()
+            .and_then(|module| module.item_list())
+            .map_or_else(|| file.items().collect(), |list| list.items().collect());
+        let mut scope = physical_module(relative);
+        if let Some(scope) = &mut scope {
+            scope.extend(
+                modules
+                    .iter()
+                    .rev()
+                    .filter_map(|module| module.name())
+                    .map(|name| name.text().to_string()),
+            );
+        }
+        let declared = items
+            .iter()
+            .filter_map(|item| match item {
+                ast::Item::Module(module) => module.name(),
+                _ => None,
+            })
+            .any(|name| {
+                let name = name.text().to_string();
+                if import.path == format!("self::{name}") {
+                    return true;
+                }
+                scope.as_ref().is_some_and(|scope| {
+                    let mut path = vec!["crate".to_owned()];
+                    path.extend(scope.iter().cloned());
+                    path.push(name);
+                    import.path == path.join("::")
+                })
+            });
+        if declared {
+            candidate.import = None;
+        }
+    }
+}
+
+fn imports_same_path(segments: &[String], aliases: &BTreeMap<String, String>) -> bool {
+    segments
+        .last()
+        .and_then(|leaf| aliases.get(leaf))
+        .is_some_and(|import| *import == canonical_path(segments, aliases))
+}
+
+fn plan_import(
+    segments: &[String],
+    aliases: &BTreeMap<String, String>,
+    file: &ast::SourceFile,
+    node: &SyntaxNode,
+    source: &str,
+) -> Option<PlannedImport> {
+    if imports_same_path(segments, aliases) {
+        return None;
+    }
+    let (insertion, indent) = scoped_import_insertion(file, node, source);
+    Some(PlannedImport {
+        path: canonical_path(segments, aliases),
+        cfg_test: false,
+        insertion,
+        indent,
+    })
 }
 
 fn collect_relative_imports(
@@ -383,9 +463,16 @@ fn imported_type_names(file: &ast::SourceFile) -> HashSet<String> {
     names
 }
 
-fn module_aliases(file: &ast::SourceFile) -> BTreeMap<String, String> {
+fn enclosing_module_aliases(node: &SyntaxNode) -> Option<BTreeMap<String, String>> {
+    node.ancestors()
+        .filter_map(ast::Module::cast)
+        .find_map(|module| module.item_list())
+        .map(|list| module_aliases(list.items()))
+}
+
+fn module_aliases(items: impl Iterator<Item = ast::Item>) -> BTreeMap<String, String> {
     let mut aliases = BTreeMap::new();
-    for import in file.items().filter_map(|item| match item {
+    for import in items.filter_map(|item| match item {
         ast::Item::Use(import) => Some(import.syntax().text().to_string()),
         _ => None,
     }) {
@@ -439,6 +526,15 @@ fn top_level_group_entries(group: &str) -> Vec<&str> {
 }
 
 fn canonical_path(segments: &[String], aliases: &BTreeMap<String, String>) -> String {
+    let segments = if segments.first().is_some_and(|root| root == "self")
+        && segments
+            .get(1)
+            .is_some_and(|binding| aliases.contains_key(binding))
+    {
+        &segments[1..]
+    } else {
+        segments
+    };
     aliases.get(&segments[0]).map_or_else(
         || segments.join("::"),
         |prefix| {
@@ -465,10 +561,7 @@ fn simple_segments(path: &ast::Path) -> Option<Vec<String>> {
 }
 
 fn exempt_root(root: &str) -> bool {
-    matches!(
-        root,
-        "std" | "core" | "alloc" | "proc_macro" | "crate" | "self" | "super" | "Self"
-    )
+    matches!(root, "std" | "core" | "alloc" | "proc_macro" | "Self")
 }
 
 fn exempt_path_root(root: &str, aliases: &BTreeMap<String, String>) -> bool {

@@ -376,3 +376,63 @@ fn fixes_integration_support_method_spacing_idempotently() {
         expected
     );
 }
+
+#[test]
+fn fixes_crate_self_and_super_paths_without_changing_behavior() {
+    let directory = tempdir().expect("temporary directory");
+    fs::create_dir_all(directory.path().join("src/app")).expect("source directories");
+    fs::write(
+        directory.path().join("Cargo.toml"),
+        "[package]\nname='local_paths'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .expect("manifest");
+    fs::write(
+        directory.path().join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"local_paths\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("lockfile");
+    fs::write(
+        directory.path().join("src/lib.rs"),
+        "pub mod app;\npub mod model;\npub mod runner;\n\npub fn run() { crate::runner::run(); }\n",
+    )
+    .expect("library");
+    fs::write(directory.path().join("src/model.rs"), "pub struct Opponent;\n\npub enum State { Ready }\n\nimpl Opponent {\n    pub fn new() -> Self { Self }\n}\n").expect("model");
+    fs::write(directory.path().join("src/runner.rs"), "pub fn run() {}\n").expect("runner");
+    fs::write(directory.path().join("src/app/child.rs"), "pub fn example(value: super::super::model::Opponent) {\n    super::super::runner::run();\n    let _ = value;\n}\n").expect("child");
+    let app = directory.path().join("src/app.rs");
+    fs::write(&app, "pub mod child;\nuse crate::model;\n\npub fn example(value: crate::model::Opponent) {\n    let _ = self::model::Opponent::new();\n    let _ = crate::model::State::Ready;\n    crate::runner::run();\n    child::example(value);\n}\n").expect("application");
+    let check = [
+        OsString::from("stylon"),
+        directory.path().as_os_str().to_owned(),
+    ];
+    assert_eq!(
+        super::super::run(check.clone()),
+        std::process::ExitCode::FAILURE
+    );
+    let fix = [
+        OsString::from("stylon"),
+        OsString::from("--fix"),
+        directory.path().as_os_str().to_owned(),
+    ];
+    assert_eq!(
+        super::super::run(fix.clone()),
+        std::process::ExitCode::SUCCESS
+    );
+    let fixed = fs::read_to_string(&app).expect("fixed application");
+    assert!(fixed.contains("value: Opponent"));
+    assert!(fixed.contains("Opponent::new()"));
+    assert!(fixed.contains("State::Ready"));
+    assert!(fixed.contains("runner::run()"));
+    assert!(!fixed.contains("self::"));
+    assert!(
+        !fs::read_to_string(directory.path().join("src/app/child.rs"))
+            .expect("fixed child")
+            .contains("super::")
+    );
+    assert_eq!(super::super::run(check), std::process::ExitCode::SUCCESS);
+    assert_eq!(super::super::run(fix), std::process::ExitCode::SUCCESS);
+    assert_eq!(
+        fs::read_to_string(app).expect("idempotent application"),
+        fixed
+    );
+}

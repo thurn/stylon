@@ -704,8 +704,9 @@ retain a distinguishing qualifier or fail planning if identity cannot be preserv
 
 All three path rules exempt paths rooted in `std`, `core`, `alloc`, or
 `proc_macro`, including imported aliases of those modules. Paths rooted in
-`crate`, `self`, or `super` are also exempt from qualification checks. The
-separate import rule still prohibits `use self::...` and `use super::...`.
+`crate`, `self`, or `super` follow the same qualification rules as other paths.
+Imports retain their full paths; the separate import rule converts `use self::...`
+and `use super::...` to absolute crate paths.
 Qualified-self associated types and method-call syntax such as `value.into()`
 are exempt. A trait-method exemption never exempts a type embedded in the call;
 for example, `battlement::PanelPoint::default()` becomes
