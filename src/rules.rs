@@ -218,18 +218,40 @@ impl Rule for BlankLines {
     }
 
     fn check(&self, context: &RuleContext<'_>, findings: &mut Vec<Finding>) {
-        let mut previous: Option<ast::Item> = None;
-        for item in context.file.items() {
-            if matches!(item_role(context.config, &item), ItemRole::Orderable(_)) {
-                if let Some(before) = &previous
-                    && !matches!((before, &item), (ast::Item::Const(_), ast::Item::Const(_)))
-                {
-                    check_spacing(context, before, &item, findings);
-                }
-                previous = Some(item);
-            } else {
-                previous = None;
+        check_item_spacing(context, context.file.items(), findings);
+        for implementation in context
+            .file
+            .syntax()
+            .descendants()
+            .filter_map(ast::Impl::cast)
+        {
+            if let Some(items) = implementation.assoc_item_list() {
+                check_item_spacing(
+                    context,
+                    items.syntax().children().filter_map(ast::Item::cast),
+                    findings,
+                );
             }
+        }
+    }
+}
+
+fn check_item_spacing(
+    context: &RuleContext<'_>,
+    items: impl Iterator<Item = ast::Item>,
+    findings: &mut Vec<Finding>,
+) {
+    let mut previous: Option<ast::Item> = None;
+    for item in items {
+        if matches!(item_role(context.config, &item), ItemRole::Orderable(_)) {
+            if let Some(before) = &previous
+                && !matches!((before, &item), (ast::Item::Const(_), ast::Item::Const(_)))
+            {
+                check_spacing(context, before, &item, findings);
+            }
+            previous = Some(item);
+        } else {
+            previous = None;
         }
     }
 }
@@ -297,18 +319,26 @@ fn check_spacing(
     } else {
         "\n"
     };
+    let line_start = context.source[..range.start]
+        .rfind('\n')
+        .map_or(0, |offset| offset + 1);
+    let (insertion, replacement) = if context.source[line_start..range.start].trim().is_empty() {
+        (line_start, line_ending.to_owned())
+    } else {
+        (range.start, line_ending.repeat(2))
+    };
     findings.push(Finding {
         diagnostic: Diagnostic::new(
             "items.blank-lines",
-            "top-level code items must be separated by an empty line",
+            "code items must be separated by an empty line",
             context.relative.to_path_buf(),
             context.source,
             range.start,
             range.start,
         ),
         edits: vec![Edit {
-            range: range.start..range.start,
-            replacement: line_ending.to_owned(),
+            range: insertion..insertion,
+            replacement,
         }],
     });
 }

@@ -321,3 +321,58 @@ fn post_fix_validation_failure_restores_source_changes() {
     assert!(!directory.path().join(".stylon-transaction").exists());
     assert!(!directory.path().join(".stylon.lock").exists());
 }
+
+#[test]
+fn fixes_integration_support_method_spacing_idempotently() {
+    let directory = tempdir().expect("temporary directory");
+    fs::create_dir_all(directory.path().join("tests/support")).expect("support directory");
+    fs::write(
+        directory.path().join("Cargo.toml"),
+        "[package]\nname='spacing_fixture'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .expect("manifest");
+    fs::write(
+        directory.path().join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"spacing_fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("lockfile");
+    fs::write(
+        directory.path().join("stylon.toml"),
+        "version = 1\n[rules]\n\"tests.integration-only\" = true\n\"visibility.no-restricted\" = false\n",
+    )
+    .expect("configuration");
+    fs::write(
+        directory.path().join("tests/game_tests.rs"),
+        "mod support;\n\n#[test]\nfn starts() { support::ChessTest::title(); }\n",
+    )
+    .expect("integration test");
+    let path = directory.path().join("tests/support/mod.rs");
+    let source = "pub struct ChessTest;\n\nimpl ChessTest {\n  pub fn from_position() -> Self { Self }\n  pub fn title() -> Self { Self::from_position() }\n}\n";
+    fs::write(&path, source).expect("support source");
+    let check = [
+        OsString::from("stylon"),
+        directory.path().as_os_str().to_owned(),
+    ];
+    assert_eq!(
+        super::super::run(check.clone()),
+        std::process::ExitCode::FAILURE
+    );
+    assert_eq!(fs::read_to_string(&path).expect("unchanged source"), source);
+    let fix = [
+        OsString::from("stylon"),
+        OsString::from("--fix"),
+        directory.path().as_os_str().to_owned(),
+    ];
+    assert_eq!(
+        super::super::run(fix.clone()),
+        std::process::ExitCode::SUCCESS
+    );
+    let expected = source.replace("\n  pub fn title", "\n\n  pub fn title");
+    assert_eq!(fs::read_to_string(&path).expect("fixed source"), expected);
+    assert_eq!(super::super::run(check), std::process::ExitCode::SUCCESS);
+    assert_eq!(super::super::run(fix), std::process::ExitCode::SUCCESS);
+    assert_eq!(
+        fs::read_to_string(path).expect("idempotent source"),
+        expected
+    );
+}

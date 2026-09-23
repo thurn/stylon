@@ -1026,7 +1026,8 @@ barrier.
 
 #### `items.blank-lines`
 
-At least one empty physical line separates adjacent orderable code items.
+At least one empty physical line separates adjacent orderable code items at file
+level and within inherent or trait `impl` blocks, including nested impls.
 Consecutive `const` declarations are the only spacing exception. Consecutive
 imports and ordinary external module declarations may remain compact because
 they are not orderable code items.

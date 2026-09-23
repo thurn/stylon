@@ -148,3 +148,78 @@ fn resolves_reference_definitions_across_doc_comment_lines() {
             .all(|finding| finding.diagnostic.rule_id != "rustdoc.type-links")
     );
 }
+
+#[test]
+fn spaces_impl_items_without_changing_indentation_or_attached_docs() {
+    let (_directory, config) = config();
+    let source = "impl ChessTest {\n  pub fn from_position() {}\n  /// Starts at the title.\n  #[inline]\n  pub fn title() {}\n  pub fn persisted() {}\n}\n";
+    let expected = "impl ChessTest {\n  pub fn from_position() {}\n\n  /// Starts at the title.\n  #[inline]\n  pub fn title() {}\n\n  pub fn persisted() {}\n}\n";
+    for ending in ["\n", "\r\n"] {
+        let source = source.replace('\n', ending);
+        let findings = check(&config, Path::new("tests/support/game.rs"), &source);
+        let mut edits: Vec<_> = findings
+            .iter()
+            .filter(|finding| finding.diagnostic.rule_id == "items.blank-lines")
+            .flat_map(|finding| finding.edits.clone())
+            .collect();
+        assert_eq!(edits.len(), 2);
+        edits.sort_by_key(|edit| edit.range.start);
+        let mut fixed = source;
+        for edit in edits.into_iter().rev() {
+            fixed.replace_range(edit.range, &edit.replacement);
+        }
+        assert_eq!(fixed, expected.replace('\n', ending));
+        assert!(check(&config, Path::new("tests/support/game.rs"), &fixed).is_empty());
+    }
+}
+
+#[test]
+fn impl_spacing_respects_constants_macros_and_existing_blank_lines() {
+    let (_directory, config) = config();
+    for source in [
+        "impl Example {\n  const A: u8 = 1;\n  const B: u8 = 2;\n\n  fn first() {}\n \t\n  fn second() {}\n}\n",
+        "impl Example {\n  fn first() {}\n  opaque!();\n  fn second() {}\n}\n",
+    ] {
+        assert!(check(&config, Path::new("src/lib.rs"), source).is_empty());
+    }
+    for source in [
+        "impl Example {\n  const A: u8 = 1;\n  fn first() {}\n}\n",
+        "impl Trait for Example {\n  type Output = u8;\n  fn first() {}\n}\n",
+        "mod nested { impl Example {\n  fn first() {}\n  fn second() {}\n} }\n",
+        "impl Example { fn first() {} fn second() {} }\n",
+    ] {
+        let findings = check(&config, Path::new("src/lib.rs"), source);
+        let spacing: Vec<_> = findings
+            .iter()
+            .filter(|finding| finding.diagnostic.rule_id == "items.blank-lines")
+            .collect();
+        assert_eq!(spacing.len(), 1, "{source}");
+        let mut fixed = source.to_owned();
+        for edit in &spacing[0].edits {
+            fixed.replace_range(edit.range.clone(), &edit.replacement);
+        }
+        assert!(
+            check(&config, Path::new("src/lib.rs"), &fixed)
+                .iter()
+                .all(|finding| finding.diagnostic.rule_id != "items.blank-lines")
+        );
+    }
+}
+
+#[test]
+fn impl_spacing_obeys_test_directory_overrides() {
+    let (directory, _) = config();
+    fs::write(
+        directory.path().join("stylon.toml"),
+        "version = 1\n[[overrides]]\npaths = [\"tests/**\"]\n[overrides.rules]\n\"items.blank-lines\" = false\n",
+    )
+    .expect("configuration");
+    let config = Config::load(directory.path(), None).expect("configuration");
+    let source = "impl Example {\n  fn first() {}\n  fn second() {}\n}\n";
+    assert!(check(&config, Path::new("tests/support/game.rs"), source).is_empty());
+    assert!(
+        check(&config, Path::new("src/lib.rs"), source)
+            .iter()
+            .any(|finding| finding.diagnostic.rule_id == "items.blank-lines")
+    );
+}
